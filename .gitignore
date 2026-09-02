@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+install/
+log/
+*.png
+!docs/*.png
+*.gif
+!docs/*.gif
+*.mp4
+data/*.npz
