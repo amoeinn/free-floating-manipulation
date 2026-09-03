@@ -1,9 +1,21 @@
-"""Floating-base mass matrix, coupling inertia, and the base/arm split.
+"""Floating-base mass matrix, coupling inertia, and the generalized Jacobian.
 
-Phase 2a. With zero initial momentum and no external force, the base twist
-is fixed at every instant by the joint rates:
+Phases 2a and 2b. With zero initial momentum and no external force, the
+base twist is fixed at every instant by the joint rates:
 
     H_b v_b + H_bm qdot = 0        ->        v_b = -H_b^-1 H_bm qdot
+
+and the end-effector velocity, J_m qdot on a fixed base, picks up the base
+reaction:
+
+    xdot = J_m qdot + J_b v_b = (J_m - J_b H_b^-1 H_bm) qdot = J_g qdot
+
+J_g (Umetani and Yoshida, 1989) is what the planner works against. It
+depends on the mass distribution, not only the geometry. J_b, H_b and H_bm
+must share one base-twist layout ([linear, angular]) and one reference
+point (the base link inertial frame); `_assert_base_convention` checks
+that numerically, because a swapped layout gives a J_g of the right shape
+that is wrong everywhere.
 
 H_b (6x6) and H_bm (6x7) are the leading blocks of the floating-base mass
 matrix
@@ -117,6 +129,7 @@ class FloatingBaseModel:
 
     def __init__(self, body: int, arm_joints: Sequence[int],
                  links: Optional[Sequence[int]] = None,
+                 end_effector: Optional[int] = None,
                  base_reference: str = "base_com",
                  base_mass: Optional[float] = None,
                  base_inertia_diagonal: Optional[Sequence[float]] = None,
@@ -128,6 +141,8 @@ class FloatingBaseModel:
             arm_joints: the joints treated as generalized coordinates.
             links: link indices to sum over. Defaults to every link on the
                 body, base link included.
+            end_effector: the link the generalized Jacobian is written for.
+                Defaults to the last link (the grasp target on the Panda).
             base_reference: which point the base twist is written about.
                 "base_com" matches PyBullet and is the default; verify_
                 mass_matrix.py shows "base_link_origin" and "system_com"
@@ -147,6 +162,12 @@ class FloatingBaseModel:
         self.base_reference = base_reference
         self._base_mass = base_mass
         self._base_inertia_diagonal = base_inertia_diagonal
+
+        if end_effector is None:
+            end_effector = p.getNumJoints(body) - 1
+        self.end_effector = end_effector
+        self._end_effector_kinematics = ForwardKinematics(
+            body, end_effector, movable_joints=self.arm_joints, dtype=dtype)
 
         if links is None:
             links = list(range(-1, p.getNumJoints(body)))
@@ -218,32 +239,65 @@ class FloatingBaseModel:
 
     # -------------------------------------------------------------- Jacobians
 
-    def link_jacobian(self, link: Link, q: torch.Tensor):
-        """(Jt, Jr), each (3, n): world linear and angular velocity of the
-        link's inertial frame per arm joint rate.
+    def _twist_transport(self, point: torch.Tensor,
+                         reference: torch.Tensor) -> torch.Tensor:
+        """6x6 mapping a base twist at `reference` to the twist at `point`.
 
-        Both come from one autograd pass over the pose that `kinematics.py`
-        produces. Jr is recovered from the rotation-matrix derivative as
-        unskew(Rdot_j R^T), column by column.
+        [v; w] at reference  ->  [v + w x (point - reference); w] at point,
+        in [linear, angular] block order. This is the base-velocity block of
+        every link's velocity Jacobian, and evaluated at the end-effector it
+        is J_b itself, so routing both through here keeps their convention
+        identical by construction.
         """
-        if link.kinematics is None:
-            zero = torch.zeros((3, self.n), dtype=self.dtype)
-            return zero, zero
+        lever = point - reference
+        eye3 = torch.eye(3, dtype=self.dtype)
+        zero3 = torch.zeros((3, 3), dtype=self.dtype)
+        return torch.cat([
+            torch.cat([eye3, -skew(lever)], dim=1),
+            torch.cat([zero3, eye3], dim=1),
+        ], dim=0)
 
+    def _frame_jacobian(self, frame, q: torch.Tensor) -> torch.Tensor:
+        """(6, n) [linear; angular] world Jacobian of a frame.
+
+        `frame` maps q -> a 4x4 world pose. One autograd pass differentiates
+        position and flattened rotation together; the angular rows are
+        recovered column by column as unskew(Rdot_j R^T).
+        """
         def pose_vector(configuration: torch.Tensor) -> torch.Tensor:
-            pose = link.kinematics(configuration) @ link.inertial_transform
+            pose = frame(configuration)
             return torch.cat([pose[:3, 3], pose[:3, :3].reshape(9)])
 
         derivative = torch.autograd.functional.jacobian(
             pose_vector, q, create_graph=q.requires_grad, vectorize=True)
 
+        rotation = frame(q)[:3, :3]
         linear = derivative[:3]
-        rotation = self.com_pose(link, q)[:3, :3]
         angular = torch.stack([
             _unskew(derivative[3:, column].reshape(3, 3) @ rotation.T)
             for column in range(self.n)
         ], dim=1)
-        return linear, angular
+        return torch.cat([linear, angular], dim=0)
+
+    def link_jacobian(self, link: Link, q: torch.Tensor):
+        """(Jt, Jr), each (3, n): world linear and angular velocity of the
+        link's inertial frame per arm joint rate, base held fixed."""
+        if link.kinematics is None:
+            zero = torch.zeros((3, self.n), dtype=self.dtype)
+            return zero, zero
+        jacobian = self._frame_jacobian(
+            lambda qq: link.kinematics(qq) @ link.inertial_transform, q)
+        return jacobian[:3], jacobian[3:]
+
+    def manipulator_jacobian(self, q: torch.Tensor) -> torch.Tensor:
+        """J_m, (6, n): the fixed-base end-effector Jacobian, [linear; angular]."""
+        return self._frame_jacobian(self._end_effector_kinematics, q)
+
+    def base_jacobian(self, q: torch.Tensor) -> torch.Tensor:
+        """J_b, (6, 6): end-effector twist produced by a base twist, joints
+        fixed. Same [linear, angular] layout and reference point as H_b."""
+        end_effector = self._end_effector_kinematics(q)[:3, 3]
+        return self._twist_transport(end_effector, self._reference_point(q))
 
     # ------------------------------------------------------------ mass matrix
 
@@ -272,8 +326,6 @@ class FloatingBaseModel:
         size = 6 + self.n
         matrix = torch.zeros((size, size), dtype=self.dtype)
         reference = self._reference_point(q)
-        eye3 = torch.eye(3, dtype=self.dtype)
-        zero3 = torch.zeros((3, 3), dtype=self.dtype)
 
         for link in self.links:
             mass = self._effective_mass(link, fingers)
@@ -283,9 +335,12 @@ class FloatingBaseModel:
             position, rotation = self.com_frame(link, q)
             linear_arm, angular_arm = self.link_jacobian(link, q)
 
-            lever = position - reference
-            linear = torch.cat([eye3, -skew(lever), linear_arm], dim=1)
-            angular = torch.cat([zero3, eye3, angular_arm], dim=1)
+            # Full link CoM Jacobian: base block from _twist_transport (the
+            # same map J_b uses), arm block from autograd.
+            transport = self._twist_transport(position, reference)
+            jacobian = torch.cat(
+                [transport, torch.cat([linear_arm, angular_arm], dim=0)], dim=1)
+            linear, angular = jacobian[:3], jacobian[3:]
 
             inertia_world = (rotation @ torch.diag(link.inertia_diagonal)
                              @ rotation.T)
@@ -303,6 +358,63 @@ class FloatingBaseModel:
     def base_velocity(self, q: torch.Tensor, joint_rates: torch.Tensor,
                       fingers: str = "exact") -> torch.Tensor:
         """Base twist implied by joint rates at zero total momentum:
-        v_b = -H_b^-1 H_bm qdot."""
+        v_b = -H_b^-1 H_bm qdot, in [linear, angular] about the base
+        reference point."""
         base_inertia, coupling = self.coupling(q, fingers=fingers)
         return -torch.linalg.solve(base_inertia, coupling @ joint_rates)
+
+    # -------------------------------------------------- generalized Jacobian
+
+    def _assert_base_convention(self, q: torch.Tensor, fingers: str) -> None:
+        """Guard the one mistake that makes J_g the right shape and wrong
+        everywhere: J_b and H_b disagreeing on the base-twist layout.
+
+        Both must be [linear, angular] about the same point. Checked by
+        value, not by reading the code:
+
+          - H_b's leading 3x3 block is the translational inertia, exactly
+            total_mass . I. That holds only in [linear, angular] order; in
+            [angular, linear] order it would be the rotational inertia.
+          - J_b's leading 3x3 block is I and its lower-left block is 0: a
+            pure base translation carries the end-effector one for one and
+            adds no rotation. Again only true in [linear, angular] order.
+        """
+        if self.base_reference != "base_com":
+            raise ValueError(
+                "generalized_jacobian needs base_reference='base_com' to "
+                f"match the mass matrix; got {self.base_reference!r}")
+
+        eye3 = torch.eye(3, dtype=self.dtype)
+        zero3 = torch.zeros((3, 3), dtype=self.dtype)
+        total_mass = sum(self._effective_mass(link, fingers)
+                         for link in self.links)
+
+        base_inertia, _ = self.coupling(q, fingers=fingers)
+        if not torch.allclose(base_inertia[:3, :3], total_mass * eye3,
+                              atol=1e-6):
+            raise AssertionError(
+                "H_b leading block is not total_mass.I; the base DoF are not "
+                "in the [linear, angular] order J_b assumes")
+
+        base_jacobian = self.base_jacobian(q)
+        if not torch.allclose(base_jacobian[:3, :3], eye3, atol=1e-9):
+            raise AssertionError(
+                "J_b leading block is not I; base-twist order disagrees "
+                "with H_b")
+        if not torch.allclose(base_jacobian[3:, :3], zero3, atol=1e-9):
+            raise AssertionError(
+                "J_b maps base translation into end-effector rotation; "
+                "base-twist order is wrong")
+
+    def generalized_jacobian(self, q: torch.Tensor,
+                             fingers: str = "exact") -> torch.Tensor:
+        """J_g = J_m - J_b H_b^-1 H_bm, (6, n), [linear; angular].
+
+        The map from joint rates to end-effector velocity on the free
+        floating base at zero total momentum.
+        """
+        self._assert_base_convention(q, fingers)
+        manipulator = self.manipulator_jacobian(q)
+        base = self.base_jacobian(q)
+        base_inertia, coupling = self.coupling(q, fingers=fingers)
+        return manipulator - base @ torch.linalg.solve(base_inertia, coupling)
