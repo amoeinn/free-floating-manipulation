@@ -15,12 +15,12 @@ drift. Two properties a drift artifact does not have:
     R_forward transposed, so composing the two returns almost exactly to
     the identity.
 
-Momentum is also checked directly: total linear and angular momentum stay
-at zero through the maneuver, since the motor torques are internal.
+Momentum is also checked directly, and the analytic model is integrated
+along the same path, before the loop amplitude and bus inertia are swept to
+produce the attitude-excursion figure.
 
-Then the analytic model (-H_b^-1 H_bm qdot, integrated) is checked against
-the simulation over the whole loop, and the loop amplitude and bus inertia
-are swept to produce the attitude-excursion figure.
+The mechanics live in `src/freeflight.py`; this script is the report.
+Run `pytest tests/` for the same invariants as assertions.
 
 Usage:
     python examples/verify_nonholonomy.py
@@ -40,204 +40,21 @@ import pybullet_data
 import torch
 
 from src.dynamics import FloatingBaseModel
+from src.freeflight import (ARM_JOINTS, BUS_GYRATION_SQUARED, JointLoop,
+                            disable_damping, integrate_base_rotation,
+                            rotation_angle, set_bus, simulate_loop)
 
-ARM_JOINTS = [0, 1, 2, 3, 4, 5, 6]
-LOOP_JOINTS = (1, 2)          # panda_joint2, panda_joint3: the arm's heavy pair
-FINGER_JOINTS = [9, 10]
-HOME = np.array([0.0, -0.3, 0.0, -1.8, 0.0, 1.5, 0.0])
-PERIOD = 2.0
-DEFAULT_AMPLITUDE = 0.6
-BUS_GYRATION_SQUARED = 0.25   # (0.5 m)^2, a metre-scale bus, not the Panda puck
-FIGURE = Path(__file__).resolve().parent.parent / "docs" / "attitude_excursion.png"
+LOOP = JointLoop()
 DTYPE = torch.float64
+FIGURE = Path(__file__).resolve().parent.parent / "docs" / "attitude_excursion.png"
 
-
-# ------------------------------------------------------------- the joint loop
-
-def loop_reference(phase: float, amplitude: float):
-    """Joint angles on the loop at loop phase `phase` (radians).
-
-    joint a traces a sine, joint b a raised cosine, so the pair walks a
-    circle in its own plane and the path encloses area. Both angles and
-    both rates are periodic, so the loop closes in position and velocity.
-    """
-    angles = HOME.copy()
-    a, b = LOOP_JOINTS
-    angles[a] = HOME[a] + amplitude * np.sin(phase)
-    angles[b] = HOME[b] + amplitude * (1.0 - np.cos(phase))
-    return angles
-
-
-def loop_rates(phase: float, amplitude: float, phase_rate: float):
-    rates = np.zeros(len(ARM_JOINTS))
-    a, b = LOOP_JOINTS
-    rates[a] = amplitude * np.cos(phase) * phase_rate
-    rates[b] = amplitude * np.sin(phase) * phase_rate
-    return rates
-
-
-# ------------------------------------------------------------- rotation helpers
-
-def rotation_angle(rotation: np.ndarray) -> float:
-    return float(np.arccos(np.clip((np.trace(rotation) - 1.0) / 2.0, -1.0, 1.0)))
-
-
-def rotation_vector(rotation: np.ndarray) -> np.ndarray:
-    angle = rotation_angle(rotation)
-    if angle < 1e-12:
-        return np.zeros(3)
-    axis = np.array([rotation[2, 1] - rotation[1, 2],
-                     rotation[0, 2] - rotation[2, 0],
-                     rotation[1, 0] - rotation[0, 1]])
-    return axis / np.linalg.norm(axis) * angle
-
-
-# --------------------------------------------------------------- the simulation
-
-def _world_inertia(diagonal, orientation_quaternion) -> np.ndarray:
-    rotation = np.array(p.getMatrixFromQuaternion(orientation_quaternion)
-                        ).reshape(3, 3)
-    return rotation @ np.diag(diagonal) @ rotation.T
-
-
-def total_momentum(body: int) -> tuple:
-    """(linear, angular) momentum about the world origin, and a scale for each."""
-    linear = np.zeros(3)
-    angular = np.zeros(3)
-    linear_scale = 0.0
-    angular_scale = 0.0
-
-    position, orientation = p.getBasePositionAndOrientation(body)
-    velocity, omega = p.getBaseVelocity(body)
-    info = p.getDynamicsInfo(body, -1)
-    position = np.array(position)
-    velocity = np.array(velocity)
-    omega = np.array(omega)
-    inertia = _world_inertia(info[2], orientation)
-    linear += info[0] * velocity
-    angular += info[0] * np.cross(position, velocity) + inertia @ omega
-    linear_scale += info[0] * np.linalg.norm(velocity)
-    angular_scale += np.linalg.norm(inertia @ omega)
-
-    for link in range(p.getNumJoints(body)):
-        info = p.getDynamicsInfo(body, link)
-        if info[0] == 0.0:
-            continue
-        state = p.getLinkState(body, link, computeLinkVelocity=1)
-        centre = np.array(state[0])
-        velocity = np.array(state[6])
-        omega = np.array(state[7])
-        inertia = _world_inertia(info[2], state[1])
-        linear += info[0] * velocity
-        angular += info[0] * np.cross(centre, velocity) + inertia @ omega
-        linear_scale += info[0] * np.linalg.norm(velocity)
-        angular_scale += (np.linalg.norm(inertia @ omega)
-                          + info[0] * np.linalg.norm(np.cross(centre, velocity)))
-
-    return linear, angular, max(linear_scale, 1e-12), max(angular_scale, 1e-12)
-
-
-def simulate_loop(body: int, amplitude: float, dt: float,
-                  bus_mass: float = None, direction: int = 1,
-                  revolutions: int = 1, watch_momentum: bool = False) -> dict:
-    """Drive the loop with position control on a free base; report what moved."""
-    if bus_mass is not None:
-        p.changeDynamics(body, -1, mass=bus_mass,
-                         localInertiaDiagonal=[bus_mass * BUS_GYRATION_SQUARED] * 3)
-    p.resetBasePositionAndOrientation(body, [0, 0, 0], [0, 0, 0, 1])
-    p.resetBaseVelocity(body, [0, 0, 0], [0, 0, 0])
-    for joint, angle in zip(ARM_JOINTS, HOME):
-        p.resetJointState(body, joint, float(angle), targetVelocity=0.0)
-    for joint in FINGER_JOINTS:
-        p.resetJointState(body, joint, 0.0, targetVelocity=0.0)
-
-    p.setTimeStep(dt)
-    steps = int(round(revolutions * PERIOD / dt))
-    phase_rate = direction * 2.0 * np.pi / PERIOD
-    momentum = 0.0
-
-    for step in range(1, steps + 1):
-        phase = phase_rate * (step * dt)
-        targets = loop_reference(phase, amplitude)
-        rates = loop_rates(phase, amplitude, phase_rate)
-        p.setJointMotorControlArray(
-            body, ARM_JOINTS, p.POSITION_CONTROL,
-            targetPositions=list(targets), targetVelocities=list(rates),
-            forces=[5.0e3] * len(ARM_JOINTS), positionGains=[1.0] * len(ARM_JOINTS))
-        p.setJointMotorControlArray(
-            body, FINGER_JOINTS, p.POSITION_CONTROL, targetPositions=[0.0, 0.0],
-            forces=[1.0e3, 1.0e3])
-        p.stepSimulation()
-
-        if watch_momentum and step % 25 == 0:
-            linear, angular, linear_scale, angular_scale = total_momentum(body)
-            momentum = max(momentum,
-                           np.linalg.norm(linear) / linear_scale,
-                           np.linalg.norm(angular) / angular_scale)
-
-    final_angles = np.array([p.getJointState(body, j)[0] for j in ARM_JOINTS])
-    orientation = p.getBasePositionAndOrientation(body)[1]
-    rotation = np.array(p.getMatrixFromQuaternion(orientation)).reshape(3, 3)
-    return {
-        "rotation": rotation,
-        "angle": rotation_angle(rotation),
-        "vector": rotation_vector(rotation),
-        "closure": float(np.abs(final_angles - HOME).max()),
-        "momentum": momentum,
-    }
-
-
-# ------------------------------------------------------ analytic loop integral
-
-def integrate_base_rotation(model: FloatingBaseModel, amplitude: float,
-                            samples: int, frame: str) -> np.ndarray:
-    """Net base rotation from integrating omega_b = [-H_b^-1 H_bm qdot]_ang
-    once around the loop, RK4 in the loop phase."""
-    step = 2.0 * np.pi / samples
-
-    def omega(phase: float) -> np.ndarray:
-        angles = loop_reference(phase, amplitude)
-        rates = loop_rates(phase, amplitude, 2.0 * np.pi / PERIOD)
-        twist = model.base_velocity(torch.tensor(angles, dtype=DTYPE),
-                                    torch.tensor(rates, dtype=DTYPE))
-        # omega_b scales with phase_rate; integrating in phase divides it back
-        return twist[3:].numpy() * PERIOD / (2.0 * np.pi)
-
-    def exponential(vector: np.ndarray) -> np.ndarray:
-        angle = np.linalg.norm(vector)
-        if angle < 1e-15:
-            return np.eye(3)
-        unit = vector / angle
-        cross = np.array([[0, -unit[2], unit[1]],
-                          [unit[2], 0, -unit[0]],
-                          [-unit[1], unit[0], 0]])
-        return (np.eye(3) + np.sin(angle) * cross
-                + (1 - np.cos(angle)) * cross @ cross)
-
-    rotation = np.eye(3)
-    for index in range(samples):
-        phase = index * step
-        first = omega(phase)
-        middle = omega(phase + step / 2)
-        last = omega(phase + step)
-        increment = (first + 4 * middle + last) * step / 6
-        if frame == "body":
-            rotation = rotation @ exponential(increment)
-        else:
-            rotation = exponential(increment) @ rotation
-    return rotation
-
-
-# ------------------------------------------------------------------- the parts
 
 def part_nominal(body: int) -> bool:
     print("part 1: the nominal loop, and momentum along it")
-    coarse = simulate_loop(body, DEFAULT_AMPLITUDE, dt=1e-3,
-                           watch_momentum=True)
-    fine = simulate_loop(body, DEFAULT_AMPLITUDE, dt=2.5e-4,
-                         watch_momentum=True)
+    coarse = simulate_loop(body, LOOP, dt=1e-3, watch_momentum=True)
+    fine = simulate_loop(body, LOOP, dt=2.5e-4, watch_momentum=True)
     vector = fine["vector"]
-    print(f"  joints {LOOP_JOINTS} swing +/-{DEFAULT_AMPLITUDE} rad and return")
+    print(f"  joints {LOOP.joints} swing +/-{LOOP.amplitude} rad and return")
     print(f"  net base rotation: {np.degrees(fine['angle']):.4f} deg "
           f"about [{vector[0]:+.3f} {vector[1]:+.3f} {vector[2]:+.3f}]")
     print(f"  joint closure: {fine['closure']:.2e} rad")
@@ -259,15 +76,15 @@ def part_timestep(body: int) -> bool:
     angles = []
     print(f"  {'dt':>10}  {'net rotation (deg)':>18}  {'change':>10}")
     for dt in timesteps:
-        angle = np.degrees(simulate_loop(body, DEFAULT_AMPLITUDE, dt=dt)["angle"])
+        angle = np.degrees(simulate_loop(body, LOOP, dt=dt)["angle"])
         change = "" if not angles else f"{angle - angles[-1]:+.4f}"
         angles.append(angle)
         print(f"  {dt:>10.2e}  {angle:>18.4f}  {change:>10}")
 
     increments = np.abs(np.diff(angles))
-    shrinking = np.all(increments[1:] < increments[:-1])
+    shrinking = bool(np.all(increments[1:] < increments[:-1]))
     spread = abs(angles[-1] - angles[0]) / abs(angles[-1])
-    richardson = angles[-1] + (angles[-1] - angles[-2])  # first-order extrapolate
+    richardson = angles[-1] + (angles[-1] - angles[-2])
     passed = shrinking and spread < 0.02 and abs(richardson) > 1.0
     print(f"  increments shrink each halving: {shrinking}")
     print(f"  coarse-to-fine spread: {spread * 100:.2f}% of the value")
@@ -278,24 +95,20 @@ def part_timestep(body: int) -> bool:
 
 def part_reversal(body: int) -> bool:
     print("part 3: reverses sign when the loop runs backward")
-    forward = simulate_loop(body, DEFAULT_AMPLITUDE, dt=2.5e-4, direction=1)
-    backward = simulate_loop(body, DEFAULT_AMPLITUDE, dt=2.5e-4, direction=-1)
+    forward = simulate_loop(body, LOOP, dt=2.5e-4, direction=1)
+    backward = simulate_loop(body, LOOP, dt=2.5e-4, direction=-1)
 
-    composed = forward["rotation"] @ backward["rotation"]
-    residual = np.degrees(rotation_angle(composed))
+    residual = np.degrees(rotation_angle(forward["rotation"]
+                                         @ backward["rotation"]))
     single = np.degrees(forward["angle"])
-    forward_vector = forward["vector"]
-    backward_vector = backward["vector"]
-    alignment = (np.dot(forward_vector, backward_vector)
-                 / (np.linalg.norm(forward_vector)
-                    * np.linalg.norm(backward_vector)))
+    ahead, behind = forward["vector"], backward["vector"]
+    alignment = (np.dot(ahead, behind)
+                 / (np.linalg.norm(ahead) * np.linalg.norm(behind)))
 
     print(f"  forward:  {single:.4f} deg about "
-          f"[{forward_vector[0]:+.3f} {forward_vector[1]:+.3f} "
-          f"{forward_vector[2]:+.3f}]")
+          f"[{ahead[0]:+.3f} {ahead[1]:+.3f} {ahead[2]:+.3f}]")
     print(f"  backward: {np.degrees(backward['angle']):.4f} deg about "
-          f"[{backward_vector[0]:+.3f} {backward_vector[1]:+.3f} "
-          f"{backward_vector[2]:+.3f}]")
+          f"[{behind[0]:+.3f} {behind[1]:+.3f} {behind[2]:+.3f}]")
     print(f"  axis alignment forward.backward: {alignment:+.3f} (want -1)")
     print(f"  R_forward R_backward is {residual:.4f} deg from identity, "
           f"vs {single:.2f} deg for one loop")
@@ -307,21 +120,15 @@ def part_reversal(body: int) -> bool:
 def part_analytic(body: int) -> bool:
     print("part 4: analytic -H_b^-1 H_bm qdot integrated vs the simulation")
     model = FloatingBaseModel(body, ARM_JOINTS, dtype=DTYPE)
-    # Reset the base link mass the sweep's changeDynamics may have altered.
-    p.changeDynamics(body, -1, mass=2.9,
-                     localInertiaDiagonal=list(p.getDynamicsInfo(body, -1)[2]))
-
-    truth = simulate_loop(body, DEFAULT_AMPLITUDE, dt=1.25e-4)
-    truth_angle = np.degrees(truth["angle"])
+    truth_angle = np.degrees(simulate_loop(body, LOOP, dt=1.25e-4)["angle"])
 
     print(f"  {'frame':>8}  {'samples':>8}  {'net rotation (deg)':>18}  "
           f"{'vs sim':>10}")
     best = None
     for frame in ("body", "world"):
         for samples in (100, 400):
-            rotation = integrate_base_rotation(model, DEFAULT_AMPLITUDE,
-                                               samples, frame)
-            angle = np.degrees(rotation_angle(rotation))
+            angle = np.degrees(rotation_angle(
+                integrate_base_rotation(model, LOOP, samples, frame)))
             error = abs(angle - truth_angle) / truth_angle
             print(f"  {frame:>8}  {samples:>8}  {angle:>18.4f}  {error:>9.2%}")
             if samples == 400 and (best is None or error < best[1]):
@@ -342,18 +149,17 @@ def part_sweep(body: int) -> bool:
 
     excursion = np.zeros((len(bus_masses), len(amplitudes)))
     for row, mass in enumerate(bus_masses):
+        set_bus(body, float(mass))
         for column, amplitude in enumerate(amplitudes):
-            result = simulate_loop(body, float(amplitude), dt=1e-3,
-                                   bus_mass=float(mass))
-            excursion[row, column] = np.degrees(result["angle"])
+            loop = JointLoop(amplitude=float(amplitude))
+            excursion[row, column] = np.degrees(
+                simulate_loop(body, loop, dt=1e-3)["angle"])
 
     print(f"  {'bus kg':>8}  " + "  ".join(f"A={a:<4}" for a in amplitudes))
     for row, mass in enumerate(bus_masses):
         cells = "  ".join(f"{value:6.3f}" for value in excursion[row])
         print(f"  {mass:>8.0f}  {cells}")
 
-    # Small-amplitude slope on a log-log plot should be about 2 (area ~ A^2),
-    # and the bus-mass slope about -1.
     small = slice(0, 3)
     amplitude_slope = np.polyfit(np.log(amplitudes[small]),
                                  np.log(excursion[-1, small]), 1)[0]
@@ -375,6 +181,7 @@ def _write_figure(amplitudes, bus_masses, excursion) -> None:
     for row, mass in enumerate(bus_masses):
         axis.loglog(amplitudes, excursion[row], "o-", color=colours[row],
                     label=f"{mass:.0f} kg bus")
+
     # Guide line, offset clear of the data: small loops enclose area ~ A^2.
     reference = 0.4 * excursion[-1, 0] * (amplitudes / amplitudes[0]) ** 2
     axis.loglog(amplitudes, reference, "k:", lw=1.2,
@@ -386,7 +193,8 @@ def _write_figure(amplitudes, bus_masses, excursion) -> None:
     axis.grid(True, which="both", alpha=0.3)
     axis.legend(fontsize=8, loc="upper left")
     axis.text(0.98, 0.03,
-              "bus inertia $m(0.5\\,\\mathrm{m})^2$; curves bend below slope 2\n"
+              f"bus inertia $m({np.sqrt(BUS_GYRATION_SQUARED)}\\,"
+              "\\mathrm{m})^2$; curves bend below slope 2\n"
               "past ~0.5 rad, where the loop is no longer small",
               transform=axis.transAxes, ha="right", va="bottom", fontsize=7.5,
               color="0.35")
@@ -394,15 +202,6 @@ def _write_figure(amplitudes, bus_masses, excursion) -> None:
     figure.savefig(FIGURE, dpi=130)
     plt.close(figure)
     print(f"  wrote {FIGURE.relative_to(Path.cwd())}\n")
-
-
-def disable_damping(body: int) -> None:
-    """PyBullet applies 0.04 linear and 0.04 angular damping to every link
-    by default. Damping is an external force: it bleeds momentum and the
-    closed loop stops returning a clean geometric phase. Zero it."""
-    for link in range(-1, p.getNumJoints(body)):
-        p.changeDynamics(body, link, linearDamping=0.0, angularDamping=0.0,
-                         jointDamping=0.0)
 
 
 def main() -> None:
