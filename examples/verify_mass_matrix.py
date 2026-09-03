@@ -248,8 +248,8 @@ def stage_two(free_body: int, fixed_body: int, model: FloatingBaseModel,
 
 # ------------------------------------------------- stage 3: base/arm partition
 
-# PyBullet orders the base DoF [angular, linear]; PLAN.md and this module
-# use [linear, angular]. This permutation maps ours onto PyBullet's.
+# PyBullet orders the base DoF [angular, linear]; this project and this
+# module use [linear, angular]. This permutation maps ours onto PyBullet's.
 SWAP = np.zeros((6, 6))
 SWAP[:3, 3:] = np.eye(3)
 SWAP[3:, :3] = np.eye(3)
