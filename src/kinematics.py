@@ -182,17 +182,13 @@ class ForwardKinematics:
         chain.reverse()
         return chain
 
-    def _link_to_link(self, joint: JointSpec,
-                      angle: Optional[torch.Tensor]) -> torch.Tensor:
-        """Transform from the parent link frame to this joint's link frame.
+    def _parent_to_joint(self, joint: JointSpec) -> torch.Tensor:
+        """Parent link frame to this joint's frame, before the joint moves.
 
-        Three steps: apply the parent's inertial offset, apply the joint
-        origin, then rotate by the joint angle about the joint axis.
-
-        The inertial offset composes forward rather than being inverted.
-        Verified on the base joint, where getJointInfo reports an origin of
-        0.283 in z, the base inertial offset is 0.050, and getLinkState
-        puts the resulting link frame at 0.333.
+        The parent's inertial offset composes forward rather than being
+        inverted. Verified on the base joint, where getJointInfo reports an
+        origin of 0.283 in z, the base inertial offset is 0.050, and
+        getLinkState puts the resulting link frame at 0.333.
         """
         parent_inertial = transform(
             quaternion_to_matrix(joint.parent_inertial_orientation),
@@ -209,13 +205,42 @@ class ForwardKinematics:
             quaternion_to_matrix(joint.origin_orientation).T,
             joint.origin_position,
         )
-        pose = parent_inertial @ origin
+        return parent_inertial @ origin
 
+    def _link_to_link(self, joint: JointSpec,
+                      angle: Optional[torch.Tensor]) -> torch.Tensor:
+        """Transform from the parent link frame to this joint's link frame:
+        the fixed parent-to-joint transform, then the joint rotation."""
+        pose = self._parent_to_joint(joint)
         if angle is not None:
             rotation = axis_angle_to_matrix(joint.axis, angle)
             pose = pose @ transform(rotation,
                                     torch.zeros(3, dtype=self.dtype))
         return pose
+
+    def joint_frames(self, configuration: torch.Tensor):
+        """World point and axis of each input joint, plus the end pose.
+
+        Read in the joint frame before that joint's own rotation, which is
+        what a geometric Jacobian column needs: for a revolute joint,
+        column i is [axis_i x (target - point_i); axis_i]. Returns
+        ({joint index: (point (3,), axis (3,))}, end pose (4, 4)).
+        """
+        angles = {joint: configuration[i]
+                  for i, joint in enumerate(self.movable_joints)}
+        pose = torch.eye(4, dtype=self.dtype)
+        frames = {}
+        for joint in self.joints:
+            pose = pose @ self._parent_to_joint(joint)
+            angle = angles.get(joint.index) if joint.movable else None
+            if joint.index in angles:
+                frames[joint.index] = (pose[:3, 3].clone(),
+                                       pose[:3, :3] @ joint.axis)
+            if angle is not None:
+                pose = pose @ transform(
+                    axis_angle_to_matrix(joint.axis, angle),
+                    torch.zeros(3, dtype=self.dtype))
+        return frames, pose
 
     def __call__(self, configuration: torch.Tensor) -> torch.Tensor:
         """Pose of the end effector for a configuration.
