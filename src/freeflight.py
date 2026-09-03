@@ -199,13 +199,18 @@ def _hold_fingers(body: int) -> None:
 def simulate_loop(body: int, loop: JointLoop, dt: float,
                   direction: int = 1, revolutions: int = 1,
                   watch_momentum: bool = False,
-                  base_position=(0.0, 0.0, 0.0)) -> dict:
+                  base_position=(0.0, 0.0, 0.0),
+                  on_step=None) -> dict:
     """Track the loop with position control on a free base.
 
     Position control rather than a kinematic reset: resetJointState
     teleports and applies no force, so the base would never react. Motor
     torques are internal, so total momentum stays at zero and this is the
     zero-momentum case the analytic model describes.
+
+    `on_step(step, steps, phase)` is called after each stepSimulation, so a
+    caller that wants to watch the run -- the hero render, say -- can do so
+    without reimplementing the control law this function is tested on.
     """
     _reset(body, loop.home, loop.arm_joints, base_position)
     p.setTimeStep(dt)
@@ -225,6 +230,8 @@ def simulate_loop(body: int, loop: JointLoop, dt: float,
         p.stepSimulation()
         if watch_momentum and step % 25 == 0:
             worst_momentum = max(worst_momentum, momentum_residual(body))
+        if on_step is not None:
+            on_step(step, steps, phase)
 
     final = np.array([p.getJointState(body, j)[0] for j in loop.arm_joints])
     orientation = p.getBasePositionAndOrientation(body)[1]
