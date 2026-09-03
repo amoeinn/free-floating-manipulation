@@ -7,6 +7,11 @@ silently rather than raising. So print every link's mass, diagonal inertia and
 local inertial offset, total the mass, and flag anything non-positive before
 trusting the model.
 
+Load with useFixedBase=False. PyBullet zeroes the base link's mass and inertia
+when the base is fixed and only fills in the URDF values when it is free, so a
+fixed-base audit reports panda_link0 as massless when it is really 2.9 kg. The
+free-base numbers are the ones phase 2 runs on.
+
 Second, a bookkeeping question for the validation plan: does
 calculateMassMatrix widen to (6+n)x(6+n) when the base is free, giving a direct
 numerical check on H_b and H_bm, or does it always return n x n? Load the same
@@ -27,15 +32,20 @@ def audit_inertias() -> None:
     """One row per link, base link included, with a non-positive flag."""
     p.connect(p.DIRECT)
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
-    robot = p.loadURDF("franka_panda/panda.urdf", useFixedBase=True)
+    robot = p.loadURDF("franka_panda/panda.urdf", useFixedBase=False)
 
-    print("link inertia audit — franka_panda/panda.urdf")
+    print("link inertia audit — franka_panda/panda.urdf, useFixedBase=False")
     print(f"{'idx':>3}  {'name':<22} {'mass (kg)':>10}  "
           f"{'Ixx':>10} {'Iyy':>10} {'Izz':>10}  "
           f"{'inertial offset (m)':>28}  flag")
 
     total_mass = 0.0
     flagged = []
+
+    # Fixed frames carrying no mass (a mounting flange, a grasp target) are
+    # expected to read zero and are not a problem. A movable link, or one
+    # between two masses, reading zero is.
+    fixed_frames = {"panda_link8", "panda_grasptarget"}
 
     for link in range(-1, p.getNumJoints(robot)):
         if link == -1:
@@ -55,9 +65,11 @@ def audit_inertias() -> None:
             problems.append("mass<=0")
         if np.any(inertia_diag <= 0.0):
             problems.append("inertia<=0")
-        flag = ",".join(problems) if problems else ""
-        if problems:
-            flagged.append((link, name, flag))
+        expected_zero = name in fixed_frames
+        flag = ("expected (fixed frame)" if problems and expected_zero
+                else ",".join(problems))
+        if problems and not expected_zero:
+            flagged.append((link, name, ",".join(problems)))
 
         offset = (f"({inertial_pos[0]:+.3f}, {inertial_pos[1]:+.3f}, "
                   f"{inertial_pos[2]:+.3f})")
@@ -69,16 +81,20 @@ def audit_inertias() -> None:
           f"{p.getNumJoints(robot)} joint links)")
     print(f"  total mass: {total_mass:.5f} kg")
 
+    print(f"  arm, hand and fingers (links 0-11): "
+          f"{total_mass - p.getDynamicsInfo(robot, -1)[0]:.5f} kg")
+
     if flagged:
-        print(f"\n  FLAGGED {len(flagged)} link(s) with non-positive "
-              f"mass or inertia:")
+        print(f"\n  FLAGGED {len(flagged)} unexpected link(s) with "
+              f"non-positive mass or inertia:")
         for link, name, flag in flagged:
             print(f"    link {link:>2} {name:<22} {flag}")
         print("  a free-floating run on this model is not trustworthy "
               "until these are fixed")
     else:
-        print("\n  no zero or missing mass/inertia — model is usable "
-              "for free-floating dynamics")
+        print("\n  every load-bearing link has positive mass and inertia; "
+              "the only zeros are the two fixed frames, which is expected. "
+              "model is usable for free-floating dynamics")
 
     p.disconnect()
 
