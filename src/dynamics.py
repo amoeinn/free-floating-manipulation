@@ -29,7 +29,7 @@ M stays differentiable in q for the trajectory optimiser, at about a
 quarter the cost of differentiating the pose through autograd. Nothing
 here converts to numpy on the compute path.
 
-Frame conventions, measured not assumed (see PLAN.md and
+Frame conventions, measured not assumed (see CONTRIBUTING.md and
 verify_mass_matrix.py):
 
   - `getDynamicsInfo` field 3/4 is a link's inertial frame relative to its
@@ -46,7 +46,7 @@ verify_mass_matrix.py):
   - the reference point for the base 6 DoF is the base link's inertial
     frame ("base_com"), found by measurement: verify_mass_matrix.py sweeps
     the candidates and only that one matches PyBullet. PyBullet also orders
-    the base DoF [angular, linear]; this module keeps PLAN.md's
+    the base DoF [angular, linear]; this module keeps the project's
     [linear, angular] and the verify script permutes before comparing.
   - PyBullet zeroes the base link's mass and inertia under
     useFixedBase=True and restores the URDF values (2.9 kg, non-trivial
