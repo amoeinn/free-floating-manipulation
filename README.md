@@ -225,3 +225,9 @@ Stated rather than softened. Where a method loses is part of the result.
   a real servicer arrives with residual rates.
 - **`J_g` is built, not yet planned with.** The generalized Jacobian and its
   gradients exist and are verified; no planner consumes them yet.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
+
+This covers the code in this repository. The Franka Panda URDF and meshes are Franka Emika's, redistributed with PyBullet under their own terms.
