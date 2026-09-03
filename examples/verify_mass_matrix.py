@@ -4,7 +4,7 @@ Each stage checks the one before it, and each reports error per item rather
 than as one aggregate, because a per-link or per-block number says where a
 bug is and a norm does not.
 
-  1. Link CoM Jacobians. For every link, compare the autograd Jt and Jr
+  1. Link CoM Jacobians. For every link, compare our geometric Jt and Jr
      against calculateJacobian. A probe first pins down two PyBullet
      conventions by finite difference: how long objPositions must be, and
      what frame localPosition is in.
@@ -196,7 +196,7 @@ def stage_one(body: int, model: FloatingBaseModel,
 
     passed = worst_linear < 1e-9 and worst_angular < 1e-9
     print(f"  worst: dJt {worst_linear:.3e}, dJr {worst_angular:.3e}  "
-          f"-> {'autograd matches calculateJacobian' if passed else 'DISAGREES'}\n")
+          f"-> {'matches calculateJacobian' if passed else 'DISAGREES'}\n")
     return passed
 
 

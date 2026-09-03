@@ -22,10 +22,12 @@ matrix
 
     M(q) = sum_i [ m_i Jt_i^T Jt_i + Jr_i^T (R_i I_i R_i^T) Jr_i ]
 
-summed over every link's centre-of-mass Jacobian. `kinematics.py` already
-builds link poses in torch, so the CoM Jacobians come straight from
-autograd and M stays differentiable in q, which the trajectory optimiser
-needs later. Nothing here converts to numpy on the compute path.
+summed over every link's centre-of-mass Jacobian. The Jacobians are the
+geometric form, `[axis x (com - point); axis]` per revolute ancestor,
+built from the joint frames `kinematics.py` produces — all torch ops, so
+M stays differentiable in q for the trajectory optimiser, at about a
+quarter the cost of differentiating the pose through autograd. Nothing
+here converts to numpy on the compute path.
 
 Frame conventions, measured not assumed (see PLAN.md and
 verify_mass_matrix.py):
@@ -76,19 +78,6 @@ def skew(vector: torch.Tensor) -> torch.Tensor:
     ])
 
 
-def _unskew(matrix: torch.Tensor) -> torch.Tensor:
-    """Vector part of the skew-symmetric component of a 3x3 matrix.
-
-    Rdot R^T is skew in exact arithmetic; the symmetrisation keeps a small
-    numerical asymmetry from leaking into the angular Jacobian.
-    """
-    return 0.5 * torch.stack([
-        matrix[2, 1] - matrix[1, 2],
-        matrix[0, 2] - matrix[2, 0],
-        matrix[1, 0] - matrix[0, 1],
-    ])
-
-
 @dataclass
 class Link:
     """One link's fixed inertial data plus a chain that reaches it.
@@ -103,6 +92,10 @@ class Link:
             constant, from `getDynamicsInfo` fields 3 and 4.
         kinematics: forward kinematics to this link's URDF frame as a
             function of the arm joints, or None for the base link.
+        arm_ancestors: the arm joints that actually move this link, in
+            order. A proximal link is moved by only the first few, and the
+            Jacobian columns for the rest must be zero, not the geometric
+            formula's non-zero garbage.
     """
 
     index: int
@@ -111,6 +104,7 @@ class Link:
     inertia_diagonal: torch.Tensor
     inertial_transform: torch.Tensor
     kinematics: Optional[ForwardKinematics]
+    arm_ancestors: tuple
 
 
 class FloatingBaseModel:
@@ -163,11 +157,21 @@ class FloatingBaseModel:
         self._base_mass = base_mass
         self._base_inertia_diagonal = base_inertia_diagonal
 
+        # The geometric Jacobian columns assume every arm joint is a
+        # revolute ancestor of every link on the arm (a plain serial chain).
+        for joint in self.arm_joints:
+            if p.getJointInfo(body, joint)[2] != p.JOINT_REVOLUTE:
+                raise ValueError(
+                    f"arm joint {joint} is not revolute; the geometric "
+                    "Jacobian in this module is revolute-serial only")
+
         if end_effector is None:
             end_effector = p.getNumJoints(body) - 1
         self.end_effector = end_effector
         self._end_effector_kinematics = ForwardKinematics(
             body, end_effector, movable_joints=self.arm_joints, dtype=dtype)
+        self._end_effector_ancestors = self._arm_ancestors(
+            self._end_effector_kinematics)
 
         if links is None:
             links = list(range(-1, p.getNumJoints(body)))
@@ -201,7 +205,15 @@ class FloatingBaseModel:
             inertia_diagonal=inertia_diagonal,
             inertial_transform=inertial_transform,
             kinematics=kinematics,
+            arm_ancestors=self._arm_ancestors(kinematics),
         )
+
+    def _arm_ancestors(self, kinematics: Optional[ForwardKinematics]) -> tuple:
+        """Which arm joints lie on the chain to this link, in order."""
+        if kinematics is None:
+            return ()
+        on_chain = {joint.index for joint in kinematics.joints if joint.movable}
+        return tuple(joint for joint in self.arm_joints if joint in on_chain)
 
     # ------------------------------------------------------------------ poses
 
@@ -257,27 +269,36 @@ class FloatingBaseModel:
             torch.cat([zero3, eye3], dim=1),
         ], dim=0)
 
-    def _frame_jacobian(self, frame, q: torch.Tensor) -> torch.Tensor:
-        """(6, n) [linear; angular] world Jacobian of a frame.
+    def _arm_joint_frames(self, q: torch.Tensor) -> dict:
+        """{joint index: (world point, world axis)} for the arm joints.
 
-        `frame` maps q -> a 4x4 world pose. One autograd pass differentiates
-        position and flattened rotation together; the angular rows are
-        recovered column by column as unskew(Rdot_j R^T).
+        One pass down the end-effector chain, shared by every link's
+        Jacobian since every link is distal to all of them.
         """
-        def pose_vector(configuration: torch.Tensor) -> torch.Tensor:
-            pose = frame(configuration)
-            return torch.cat([pose[:3, 3], pose[:3, :3].reshape(9)])
+        frames, _ = self._end_effector_kinematics.joint_frames(q)
+        return frames
 
-        derivative = torch.autograd.functional.jacobian(
-            pose_vector, q, create_graph=q.requires_grad, vectorize=True)
+    def _geometric_columns(self, target: torch.Tensor, joint_frames: dict,
+                           ancestors: tuple):
+        """(linear (3, n), angular (3, n)) for a point rigidly fixed to a
+        link, base held fixed.
 
-        rotation = frame(q)[:3, :3]
-        linear = derivative[:3]
-        angular = torch.stack([
-            _unskew(derivative[3:, column].reshape(3, 3) @ rotation.T)
-            for column in range(self.n)
-        ], dim=1)
-        return torch.cat([linear, angular], dim=0)
+        For a revolute ancestor the column is [axis x (target - point);
+        axis]; for an arm joint that is not an ancestor the link does not
+        move, so the column is zero.
+        """
+        zero = torch.zeros(3, dtype=self.dtype)
+        linear = []
+        angular = []
+        for joint in self.arm_joints:
+            if joint in ancestors:
+                point, axis = joint_frames[joint]
+                linear.append(torch.linalg.cross(axis, target - point))
+                angular.append(axis)
+            else:
+                linear.append(zero)
+                angular.append(zero)
+        return torch.stack(linear, dim=1), torch.stack(angular, dim=1)
 
     def link_jacobian(self, link: Link, q: torch.Tensor):
         """(Jt, Jr), each (3, n): world linear and angular velocity of the
@@ -285,13 +306,16 @@ class FloatingBaseModel:
         if link.kinematics is None:
             zero = torch.zeros((3, self.n), dtype=self.dtype)
             return zero, zero
-        jacobian = self._frame_jacobian(
-            lambda qq: link.kinematics(qq) @ link.inertial_transform, q)
-        return jacobian[:3], jacobian[3:]
+        position = self.com_pose(link, q)[:3, 3]
+        return self._geometric_columns(position, self._arm_joint_frames(q),
+                                       link.arm_ancestors)
 
     def manipulator_jacobian(self, q: torch.Tensor) -> torch.Tensor:
         """J_m, (6, n): the fixed-base end-effector Jacobian, [linear; angular]."""
-        return self._frame_jacobian(self._end_effector_kinematics, q)
+        frames, end_pose = self._end_effector_kinematics.joint_frames(q)
+        linear, angular = self._geometric_columns(
+            end_pose[:3, 3], frames, self._end_effector_ancestors)
+        return torch.cat([linear, angular], dim=0)
 
     def base_jacobian(self, q: torch.Tensor) -> torch.Tensor:
         """J_b, (6, 6): end-effector twist produced by a base twist, joints
@@ -326,6 +350,7 @@ class FloatingBaseModel:
         size = 6 + self.n
         matrix = torch.zeros((size, size), dtype=self.dtype)
         reference = self._reference_point(q)
+        joint_frames = self._arm_joint_frames(q)
 
         for link in self.links:
             mass = self._effective_mass(link, fingers)
@@ -333,7 +358,8 @@ class FloatingBaseModel:
                 continue
 
             position, rotation = self.com_frame(link, q)
-            linear_arm, angular_arm = self.link_jacobian(link, q)
+            linear_arm, angular_arm = self._geometric_columns(
+                position, joint_frames, link.arm_ancestors)
 
             # Full link CoM Jacobian: base block from _twist_transport (the
             # same map J_b uses), arm block from autograd.
