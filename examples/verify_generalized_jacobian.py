@@ -38,6 +38,8 @@ import pybullet_data
 import torch
 
 from src.dynamics import FloatingBaseModel
+from src.freeflight import (BUS_GYRATION_SQUARED, disable_damping,
+                            simulate_held_rates)
 
 ARM_JOINTS = [0, 1, 2, 3, 4, 5, 6]
 FINGER_JOINTS = [9, 10]
@@ -57,6 +59,7 @@ def connect() -> tuple:
     # the free one is flung off at 100 m/s.
     free_body = p.loadURDF("franka_panda/panda.urdf", useFixedBase=False,
                            basePosition=FREE_BASE_POSITION)
+    disable_damping(free_body)
     return fixed_body, free_body
 
 
@@ -97,42 +100,6 @@ def check_manipulator_jacobian(fixed_body: int, model: FloatingBaseModel,
 
 # ------------------------------------------------- part 1: J_g vs simulation
 
-def simulate(free_body: int, arm_angles: np.ndarray, joint_rates: np.ndarray,
-             dt: float = 1e-4, steps: int = 12) -> dict:
-    """Drive the arm at joint_rates on the free base and read what moves."""
-    p.resetBasePositionAndOrientation(free_body, FREE_BASE_POSITION,
-                                      [0, 0, 0, 1])
-    p.resetBaseVelocity(free_body, [0, 0, 0], [0, 0, 0])
-    for joint, angle in zip(ARM_JOINTS, arm_angles):
-        p.resetJointState(free_body, joint, float(angle), targetVelocity=0.0)
-    for joint in FINGER_JOINTS:
-        p.resetJointState(free_body, joint, 0.0, targetVelocity=0.0)
-
-    # Velocity control holds the commanded joint rates; the base is free to
-    # react. Motor torques are internal so total momentum stays at zero.
-    p.setJointMotorControlArray(free_body, ARM_JOINTS, p.VELOCITY_CONTROL,
-                                targetVelocities=list(joint_rates),
-                                forces=[1.0e3] * len(ARM_JOINTS))
-    p.setJointMotorControlArray(free_body, FINGER_JOINTS, p.VELOCITY_CONTROL,
-                                targetVelocities=[0.0, 0.0],
-                                forces=[1.0e3, 1.0e3])
-    p.setTimeStep(dt)
-    for _ in range(steps):
-        p.stepSimulation()
-
-    states = p.getJointStates(free_body, ARM_JOINTS)
-    link = p.getLinkState(free_body, END_EFFECTOR, computeLinkVelocity=1,
-                          computeForwardKinematics=1)
-    base_linear, base_angular = p.getBaseVelocity(free_body)
-    return {
-        "q": np.array([s[0] for s in states]),
-        "qdot": np.array([s[1] for s in states]),
-        "ee_twist": np.concatenate([np.array(link[6]), np.array(link[7])]),
-        "base_twist": np.concatenate([np.array(base_linear),
-                                      np.array(base_angular)]),
-    }
-
-
 def check_against_simulation(free_body: int, model: FloatingBaseModel,
                              configurations: np.ndarray) -> bool:
     print("part 1: J_g qdot vs a free-floating simulation")
@@ -144,7 +111,8 @@ def check_against_simulation(free_body: int, model: FloatingBaseModel,
     worst_base = 0.0
     for index, arm_angles in enumerate(configurations):
         joint_rates = rng.uniform(-0.6, 0.6, size=len(ARM_JOINTS))
-        measured = simulate(free_body, arm_angles, joint_rates)
+        measured = simulate_held_rates(free_body, arm_angles, joint_rates,
+                                       base_position=FREE_BASE_POSITION)
 
         q = torch.tensor(measured["q"], dtype=DTYPE)
         rates = torch.tensor(measured["qdot"], dtype=DTYPE)
@@ -176,11 +144,10 @@ def check_against_simulation(free_body: int, model: FloatingBaseModel,
 def bus_sweep(free_body: int, configurations: np.ndarray) -> bool:
     print("part 2: J_g -> J_m as the bus grows")
     # A real servicing bus is metres across, not the Panda pedestal's dense
-    # puck, so model it with a fixed radius of gyration: I_bus = m k^2 I_3
-    # with k = 0.5 m (a ~1.5 m box). Using the pedestal's tiny k^2 for a
-    # 30-tonne bus leaves the arm's own O(5 kg m^2) in the rotational block
-    # and the limit never cleans up.
-    gyration_squared = 0.25
+    # puck, so model it with a fixed radius of gyration. Using the pedestal's
+    # tiny k^2 for a 30-tonne bus leaves the arm's own O(5 kg m^2) in the
+    # rotational block and the limit never cleans up.
+    gyration_squared = BUS_GYRATION_SQUARED
     bus_masses = np.array([100.0, 300.0, 1000.0, 3000.0, 10000.0, 30000.0,
                            100000.0])
     relative_error = []
