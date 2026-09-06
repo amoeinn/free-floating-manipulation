@@ -5,8 +5,7 @@ import pybullet as p
 import pytest
 import torch
 
-from src.dynamics import FloatingBaseModel
-from src.freeflight import ARM_JOINTS, FINGER_JOINTS
+from src.freeflight import ARM_JOINTS, FINGER_JOINTS, build_model, panda_spec
 
 DTYPE = torch.float64
 ARM = len(ARM_JOINTS)
@@ -16,6 +15,35 @@ ARM = len(ARM_JOINTS)
 SWAP = np.zeros((6, 6))
 SWAP[:3, 3:] = np.eye(3)
 SWAP[3:, :3] = np.eye(3)
+
+
+def _diagonalisation_floor(body):
+    """How well PyBullet reproduces the declared inertia tensors."""
+    declared = panda_spec()["inertials"]
+    if declared is None:
+        return 0.0
+    worst = 0.0
+    for link in range(-1, p.getNumJoints(body)):
+        info = p.getDynamicsInfo(body, link)
+        name = (p.getBodyInfo(body)[0].decode() if link == -1
+                else p.getJointInfo(body, link)[12].decode())
+        if info[0] == 0.0 or name not in declared:
+            continue
+        rotation = np.asarray(p.getMatrixFromQuaternion(info[4])).reshape(3, 3)
+        worst = max(worst, float(np.abs(
+            rotation @ np.diag(info[2]) @ rotation.T - declared[name][3]).max()))
+    return worst
+
+
+def _base_axes(body):
+    """Base link axes to base inertial axes. PyBullet writes the base twist
+    in the latter; identity whenever the base inertia tensor is diagonal."""
+    rotation = np.asarray(p.getMatrixFromQuaternion(
+        p.getDynamicsInfo(body, -1)[4])).reshape(3, 3)
+    block = np.zeros((6, 6))
+    block[:3, :3] = rotation
+    block[3:, 3:] = rotation
+    return block
 
 
 def _full(angles):
@@ -32,8 +60,13 @@ def test_base_link_carries_mass_only_when_the_base_is_free(panda_fixed,
     fixed-base load silently loses it, and every H_b that follows is wrong
     by that mass with no error raised anywhere.
     """
+    declared = panda_spec()["inertials"]
+    base_name = p.getBodyInfo(panda_free)[0].decode()
+    expected = (declared[base_name][0] if declared is not None
+                else 2.9)   # the PyBullet model's mesh derived base mass
+    assert expected > 0.0, "this model has no base mass to lose"
     assert p.getDynamicsInfo(panda_fixed, -1)[0] == 0.0
-    assert p.getDynamicsInfo(panda_free, -1)[0] == pytest.approx(2.9)
+    assert p.getDynamicsInfo(panda_free, -1)[0] == pytest.approx(expected)
     assert max(p.getDynamicsInfo(panda_free, -1)[2]) > 0.0
 
 
@@ -54,9 +87,14 @@ def test_com_jacobian_is_taken_at_the_inertial_frame_not_the_link_frame(
 
     mine, _ = model.link_jacobian(link, torch.tensor(angles, dtype=DTYPE))
 
+    # localPosition is in the link's inertial frame, so the centre of mass
+    # is at R_inertial^T times the offset. That reduces to the bare offset
+    # only while the inertial frame is axis aligned, which is a property of
+    # this particular Panda and not of robots.
+    rotation = np.asarray(p.getMatrixFromQuaternion(info[4])).reshape(3, 3)
     at_inertial, _ = p.calculateJacobian(panda_fixed, link.index,
-                                         list(info[3]), _full(angles),
-                                         zeros, zeros)
+                                         list(rotation.T @ np.asarray(info[3])),
+                                         _full(angles), zeros, zeros)
     at_link_origin, _ = p.calculateJacobian(panda_fixed, link.index,
                                             [0.0, 0.0, 0.0], _full(angles),
                                             zeros, zeros)
@@ -112,8 +150,10 @@ def test_translational_block_is_total_mass_times_identity(model,
     It is also what pins the base DoF order down: in [angular, linear]
     order this block would be the rotational inertia instead.
     """
+    # Not a literal: the two models have different masses, and pinning one
+    # of them here is how these tests stopped being about the invariant.
     total = sum(link.mass for link in model.links)
-    assert total == pytest.approx(17.96)
+    assert total > 1.0
     for angles in configurations:
         matrix = model.mass_matrix(torch.tensor(angles, dtype=DTYPE)).numpy()
         assert np.abs(matrix[:3, :3] - total * np.eye(3)).max() < 1e-12
@@ -134,10 +174,15 @@ def test_base_inertia_and_coupling_match_free_base_mass_matrix(
             torch.tensor(angles, dtype=DTYPE))
         truth = np.asarray(p.calculateMassMatrix(panda_free, _full(angles)))
 
-        assert np.abs(SWAP @ base_inertia.numpy() @ SWAP
-                      - truth[:6, :6]).max() < 1e-10
-        assert np.abs(SWAP @ coupling.numpy()
-                      - truth[:6, 6:6 + ARM]).max() < 1e-10
+        axes = _base_axes(panda_free)
+        # PyBullet stores an inertia tensor as principal moments plus a
+        # rotation, so a model with off-diagonal terms is only reproduced as
+        # well as its eigensolve. Judge against that floor, not a constant.
+        tolerance = max(1e-10, 50 * _diagonalisation_floor(panda_free))
+        assert np.abs(SWAP @ (axes.T @ base_inertia.numpy() @ axes) @ SWAP
+                      - truth[:6, :6]).max() < tolerance
+        assert np.abs(SWAP @ (axes.T @ coupling.numpy())
+                      - truth[:6, 6:6 + ARM]).max() < tolerance
 
 
 def test_the_wrong_base_reference_point_does_not_also_match(panda_free,
@@ -150,10 +195,10 @@ def test_the_wrong_base_reference_point_does_not_also_match(panda_free,
     angles = configurations[0]
     truth = np.asarray(p.calculateMassMatrix(panda_free, _full(angles)))
     for reference in ("base_link_origin", "system_com"):
-        other = FloatingBaseModel(panda_free, ARM_JOINTS,
-                                  base_reference=reference, dtype=DTYPE)
+        other = build_model(panda_free, base_reference=reference, dtype=DTYPE)
         base_inertia, _ = other.coupling(torch.tensor(angles, dtype=DTYPE))
-        assert np.abs(SWAP @ base_inertia.numpy() @ SWAP
+        axes = _base_axes(panda_free)
+        assert np.abs(SWAP @ (axes.T @ base_inertia.numpy() @ axes) @ SWAP
                       - truth[:6, :6]).max() > 0.1
 
 
@@ -163,9 +208,8 @@ def test_arm_block_is_independent_of_the_base_reference_point(
     not touch it. Isolates a bug in the link Jacobians from a bug in the
     base-frame bookkeeping."""
     angles = torch.tensor(configurations[0], dtype=DTYPE)
-    blocks = [FloatingBaseModel(panda_free, ARM_JOINTS,
-                                base_reference=reference,
-                                dtype=DTYPE).mass_matrix(angles)[6:, 6:].numpy()
+    blocks = [build_model(panda_free, base_reference=reference,
+                          dtype=DTYPE).mass_matrix(angles)[6:, 6:].numpy()
               for reference in ("base_com", "base_link_origin", "system_com")]
     for block in blocks[1:]:
         assert np.abs(block - blocks[0]).max() < 1e-10

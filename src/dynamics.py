@@ -67,6 +67,24 @@ import torch
 from src.kinematics import ForwardKinematics, quaternion_to_matrix, transform
 
 
+def _rpy_to_matrix(rpy, dtype: torch.dtype) -> torch.Tensor:
+    """Rotation matrix from URDF roll pitch yaw, applied Z then Y then X."""
+    roll, pitch, yaw = (torch.tensor(float(v), dtype=dtype) for v in rpy)
+    def axis(c, s, which):
+        one = torch.ones((), dtype=dtype)
+        zero = torch.zeros((), dtype=dtype)
+        if which == "x":
+            rows = [[one, zero, zero], [zero, c, -s], [zero, s, c]]
+        elif which == "y":
+            rows = [[c, zero, s], [zero, one, zero], [-s, zero, c]]
+        else:
+            rows = [[c, -s, zero], [s, c, zero], [zero, zero, one]]
+        return torch.stack([torch.stack(r) for r in rows])
+    return (axis(torch.cos(yaw), torch.sin(yaw), "z")
+            @ axis(torch.cos(pitch), torch.sin(pitch), "y")
+            @ axis(torch.cos(roll), torch.sin(roll), "x"))
+
+
 def skew(vector: torch.Tensor) -> torch.Tensor:
     """The 3x3 matrix S with S w = vector x w."""
     x, y, z = vector
@@ -86,8 +104,12 @@ class Link:
         index: PyBullet link index, -1 for the base link.
         name: link name, for the per-link error tables.
         mass: link mass in kg, `getDynamicsInfo` field 0.
-        inertia_diagonal: principal moments about the inertial frame,
-            `getDynamicsInfo` field 2.
+        inertia: the full symmetric inertia tensor about the centre of
+            mass, expressed in the inertial frame. PyBullet reports
+            principal moments and a rotation that diagonalises them, so
+            reading it back through `getDynamicsInfo` always yields a
+            diagonal here; a URDF that declares off-diagonal terms does
+            not, which is why this is a matrix rather than three numbers.
         inertial_transform: 4x4, the link frame -> inertial frame transform,
             constant, from `getDynamicsInfo` fields 3 and 4.
         kinematics: forward kinematics to this link's URDF frame as a
@@ -101,7 +123,7 @@ class Link:
     index: int
     name: str
     mass: float
-    inertia_diagonal: torch.Tensor
+    inertia: torch.Tensor
     inertial_transform: torch.Tensor
     kinematics: Optional[ForwardKinematics]
     arm_ancestors: tuple
@@ -127,6 +149,9 @@ class FloatingBaseModel:
                  base_reference: str = "base_com",
                  base_mass: Optional[float] = None,
                  base_inertia_diagonal: Optional[Sequence[float]] = None,
+                 base_inertia: Optional[Sequence[Sequence[float]]] = None,
+                 inertials: Optional[dict] = None,
+                 urdf: Optional[str] = None,
                  dtype: torch.dtype = torch.float64):
         """
         Args:
@@ -146,6 +171,17 @@ class FloatingBaseModel:
                 kilograms while the Panda arm stays fixed.
             base_inertia_diagonal: if given, replaces the base link's
                 principal moments (3 values, about its inertial frame).
+                Equivalent to passing a diagonal `base_inertia`.
+            base_inertia: if given, replaces the base link's full inertia
+                tensor (3x3, about its inertial frame). Takes precedence
+                over `base_inertia_diagonal`.
+            inertials: if given, {link name: (mass, com xyz, com rpy,
+                3x3 tensor)} read from the URDF, used in place of
+                `getDynamicsInfo`. PyBullet is not a faithful reader of
+                declared inertias: it substitutes a unit mass and inertia
+                for a link with no inertial block, and it diagonalises the
+                tensor, which costs about 6e-9. Both matter once the model
+                carries real identified parameters.
             dtype: float64. The check is against a C++ mass matrix and
                 float32 would sit near the tolerance.
         """
@@ -156,6 +192,9 @@ class FloatingBaseModel:
         self.base_reference = base_reference
         self._base_mass = base_mass
         self._base_inertia_diagonal = base_inertia_diagonal
+        self._base_inertia = base_inertia
+        self._inertials = inertials
+        self.urdf = urdf
 
         # The geometric Jacobian columns assume every arm joint is a
         # revolute ancestor of every link on the arm (a plain serial chain).
@@ -169,7 +208,8 @@ class FloatingBaseModel:
             end_effector = p.getNumJoints(body) - 1
         self.end_effector = end_effector
         self._end_effector_kinematics = ForwardKinematics(
-            body, end_effector, movable_joints=self.arm_joints, dtype=dtype)
+            body, end_effector, movable_joints=self.arm_joints, urdf=urdf,
+            dtype=dtype)
         self._end_effector_ancestors = self._arm_ancestors(
             self._end_effector_kinematics)
 
@@ -184,25 +224,38 @@ class FloatingBaseModel:
             torch.tensor(info[3], dtype=self.dtype),
         )
         mass = info[0]
-        inertia_diagonal = torch.tensor(info[2], dtype=self.dtype)
+        inertia = torch.diag(torch.tensor(info[2], dtype=self.dtype))
+
+        link_name = (p.getBodyInfo(self.body)[0].decode() if index == -1
+                     else p.getJointInfo(self.body, index)[12].decode())
+        if self._inertials is not None and link_name in self._inertials:
+            declared_mass, xyz, rpy, tensor = self._inertials[link_name]
+            mass = float(declared_mass)
+            inertia = torch.tensor(tensor, dtype=self.dtype)
+            inertial_transform = transform(
+                _rpy_to_matrix(rpy, self.dtype),
+                torch.tensor(xyz, dtype=self.dtype))
+
         if index == -1:
             name = p.getBodyInfo(self.body)[0].decode()
             kinematics = None
             if self._base_mass is not None:
                 mass = self._base_mass
             if self._base_inertia_diagonal is not None:
-                inertia_diagonal = torch.tensor(self._base_inertia_diagonal,
-                                                dtype=self.dtype)
+                inertia = torch.diag(torch.tensor(self._base_inertia_diagonal,
+                                                  dtype=self.dtype))
+            if self._base_inertia is not None:
+                inertia = torch.tensor(self._base_inertia, dtype=self.dtype)
         else:
             name = p.getJointInfo(self.body, index)[12].decode()
             kinematics = ForwardKinematics(self.body, index,
                                            movable_joints=self.arm_joints,
-                                           dtype=self.dtype)
+                                           urdf=self.urdf, dtype=self.dtype)
         return Link(
             index=index,
             name=name,
             mass=mass,
-            inertia_diagonal=inertia_diagonal,
+            inertia=inertia,
             inertial_transform=inertial_transform,
             kinematics=kinematics,
             arm_ancestors=self._arm_ancestors(kinematics),
@@ -368,8 +421,7 @@ class FloatingBaseModel:
                 [transport, torch.cat([linear_arm, angular_arm], dim=0)], dim=1)
             linear, angular = jacobian[:3], jacobian[3:]
 
-            inertia_world = (rotation @ torch.diag(link.inertia_diagonal)
-                             @ rotation.T)
+            inertia_world = rotation @ link.inertia @ rotation.T
 
             matrix = (matrix
                       + mass * linear.T @ linear

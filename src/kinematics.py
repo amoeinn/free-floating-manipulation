@@ -12,22 +12,34 @@ joint angles looked smooth. It matters more here: a free flying servicer's
 arm motion reacts on the spacecraft base, and reasoning about that coupling
 means working in Cartesian quantities inside the optimization.
 
-The frame convention is the part that bites. getJointInfo reports a joint's
-origin relative to the parent link's INERTIAL frame, while getLinkState
-reports the LINK frame. The two differ by the parent's local inertial
-offset, which for the Panda's base is 50 mm in z. Chaining the joint
-origins directly accumulates that offset at every joint and drifts by over
-a metre across seven of them. The parent's inertial offset therefore has to
-be undone before each joint origin is applied, which is what
-_link_to_link does.
+Geometry is read from the URDF, not from PyBullet. That is a deliberate
+correction rather than a preference.
 
-Joint axes are always (0, 0, 1) here, and that is correct rather than a
-bug: the origin quaternions rotate each joint frame so its axis lies along
-z, which is why they alternate between plus and minus 0.7071 about x.
+getJointInfo reports a joint's origin relative to the parent link's
+INERTIAL frame, and an earlier version of this file composed that offset
+forward to recover link frames. It agreed with getLinkState to 5.7e-8 and
+was wrong anyway: it is only correct when every inertial frame is axis
+aligned with its link frame, which is true of the Panda URDF that ships
+with PyBullet and of nothing else in particular. PyBullet rotates a link's
+inertial frame as soon as that link's inertia tensor has off-diagonal
+terms, because it stores principal moments and the rotation that
+diagonalises them. Given such a model the old chain was exact through link
+1 and 137 mm out at link 2.
+
+The URDF states joint origins relative to the parent LINK frame, which is
+what a forward chain wants, and says nothing about inertial frames at all.
+Reading them from there removes the whole class of error. PyBullet is still
+used for the tree structure, link index to name and joint type, none of
+which is a frame convention.
+
+Joint axes on the Panda are always (0, 0, 1) and that is correct rather
+than a bug: the origin rotations carry each joint frame so its axis lies
+along z.
 """
 
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
+from xml.etree import ElementTree
 
 import numpy as np
 import pybullet as p
@@ -42,14 +54,11 @@ class JointSpec:
         index: the joint's index in PyBullet's numbering.
         name: the joint's name, for diagnostics.
         parent: the parent link index, -1 for the base.
-        origin_position: joint origin, relative to the parent's inertial
-            frame, which is how getJointInfo reports it.
-        origin_orientation: the same, as a quaternion in xyzw order.
+        origin_position: joint origin, relative to the parent LINK frame,
+            as the URDF states it.
+        origin_rotation: the same, as a 3x3 matrix built from the URDF's
+            roll pitch yaw.
         axis: the unit vector the joint rotates about, in its own frame.
-        parent_inertial_position: the parent's local inertial offset, which
-            has to be undone to get from the parent's link frame to where
-            the joint origin is measured from.
-        parent_inertial_orientation: the same, as a quaternion.
         movable: False for fixed joints, which contribute only the origin.
     """
 
@@ -57,11 +66,49 @@ class JointSpec:
     name: str
     parent: int
     origin_position: torch.Tensor
-    origin_orientation: torch.Tensor
+    origin_rotation: torch.Tensor
     axis: torch.Tensor
-    parent_inertial_position: torch.Tensor
-    parent_inertial_orientation: torch.Tensor
     movable: bool
+
+
+def rpy_to_matrix(rpy: Sequence[float], dtype: torch.dtype) -> torch.Tensor:
+    """Rotation matrix from a URDF roll pitch yaw triple, composed Rz Ry Rx."""
+    roll, pitch, yaw = (torch.tensor(float(v), dtype=dtype) for v in rpy)
+    one = torch.ones((), dtype=dtype)
+    zero = torch.zeros((), dtype=dtype)
+
+    def about(angle, which):
+        c, s = torch.cos(angle), torch.sin(angle)
+        if which == "x":
+            rows = [[one, zero, zero], [zero, c, -s], [zero, s, c]]
+        elif which == "y":
+            rows = [[c, zero, s], [zero, one, zero], [-s, zero, c]]
+        else:
+            rows = [[c, -s, zero], [s, c, zero], [zero, zero, one]]
+        return torch.stack([torch.stack(row) for row in rows])
+
+    return about(yaw, "z") @ about(pitch, "y") @ about(roll, "x")
+
+
+def read_urdf_joints(path: str) -> dict:
+    """{joint name: (origin xyz, origin rpy, axis)} straight from the URDF.
+
+    The URDF is the authority on kinematics. PyBullet re-expresses these
+    relative to the parent's inertial frame, which is a storage detail of
+    Bullet and not a fact about the robot.
+    """
+    joints = {}
+    for joint in ElementTree.parse(str(path)).getroot().findall("joint"):
+        origin = joint.find("origin")
+        xyz = [float(v) for v in ((origin.get("xyz") if origin is not None else None)
+                                  or "0 0 0").split()]
+        rpy = [float(v) for v in ((origin.get("rpy") if origin is not None else None)
+                                  or "0 0 0").split()]
+        axis = joint.find("axis")
+        direction = [float(v) for v in ((axis.get("xyz") if axis is not None else None)
+                                        or "1 0 0").split()]
+        joints[joint.get("name")] = (xyz, rpy, direction)
+    return joints
 
 
 def quaternion_to_matrix(quaternion: torch.Tensor) -> torch.Tensor:
@@ -126,6 +173,7 @@ class ForwardKinematics:
 
     def __init__(self, body: int, end_effector_link: int,
                  movable_joints: Optional[Sequence[int]] = None,
+                 urdf: Optional[str] = None,
                  dtype: torch.dtype = torch.float64):
         """
         Args:
@@ -133,24 +181,29 @@ class ForwardKinematics:
             end_effector_link: the link whose pose is wanted.
             movable_joints: joints treated as inputs. Defaults to every
                 non-fixed joint on the path to the end effector.
+            urdf: path to the URDF the body was loaded from, which is where
+                the joint geometry is read from. Required, because
+                PyBullet's own report of it depends on how it chose to
+                store inertial frames.
             dtype: float64 by default. Verification is against a C++
                 implementation and float32 would put the round trip error
                 near the tolerance being measured.
         """
+        if urdf is None:
+            raise ValueError(
+                "ForwardKinematics needs the URDF path: joint origins are read "
+                "from the file, not from getJointInfo, which reports them "
+                "relative to the parent's inertial frame")
         self.body = body
         self.end_effector_link = end_effector_link
         self.dtype = dtype
+        self.urdf = str(urdf)
+        self._urdf_joints = read_urdf_joints(self.urdf)
         self.joints = self._read_chain(end_effector_link)
 
         available = [j.index for j in self.joints if j.movable]
         self.movable_joints = (list(movable_joints)
                                if movable_joints is not None else available)
-
-    def _inertial(self, link: int):
-        """A link's local inertial offset, as tensors."""
-        info = p.getDynamicsInfo(self.body, link)
-        return (torch.tensor(info[3], dtype=self.dtype),
-                torch.tensor(info[4], dtype=self.dtype))
 
     def _read_chain(self, link: int) -> List[JointSpec]:
         """Walk from the end effector back to the base, then reverse.
@@ -165,17 +218,18 @@ class ForwardKinematics:
         while current != -1:
             info = p.getJointInfo(self.body, current)
             parent = info[16]
-            inertial_position, inertial_orientation = self._inertial(parent)
+            name = info[1].decode()
+            if name not in self._urdf_joints:
+                raise KeyError(f"joint {name} is not in {self.urdf}")
+            xyz, rpy, axis = self._urdf_joints[name]
 
             chain.append(JointSpec(
                 index=current,
-                name=info[1].decode(),
+                name=name,
                 parent=parent,
-                origin_position=torch.tensor(info[14], dtype=self.dtype),
-                origin_orientation=torch.tensor(info[15], dtype=self.dtype),
-                axis=torch.tensor(info[13], dtype=self.dtype),
-                parent_inertial_position=inertial_position,
-                parent_inertial_orientation=inertial_orientation,
+                origin_position=torch.tensor(xyz, dtype=self.dtype),
+                origin_rotation=rpy_to_matrix(rpy, self.dtype),
+                axis=torch.tensor(axis, dtype=self.dtype),
                 movable=info[2] != p.JOINT_FIXED,
             ))
             current = parent
@@ -185,27 +239,12 @@ class ForwardKinematics:
     def _parent_to_joint(self, joint: JointSpec) -> torch.Tensor:
         """Parent link frame to this joint's frame, before the joint moves.
 
-        The parent's inertial offset composes forward rather than being
-        inverted. Verified on the base joint, where getJointInfo reports an
-        origin of 0.283 in z, the base inertial offset is 0.050, and
-        getLinkState puts the resulting link frame at 0.333.
+        Straight from the URDF, which states exactly this transform. No
+        inertial frame appears anywhere in the chain, which is the point:
+        the previous version composed the parent's inertial offset forward
+        and was correct only while every such frame was axis aligned.
         """
-        parent_inertial = transform(
-            quaternion_to_matrix(joint.parent_inertial_orientation),
-            joint.parent_inertial_position,
-        )
-        # getJointInfo reports the origin orientation as the rotation from
-        # the joint frame to the parent frame, which is the inverse of what
-        # a forward chain composes, so it is transposed here. Verified
-        # against getLinkState at every link: without the transpose the
-        # chain is exact through link 1 and then diverges by 632 mm at
-        # link 2, because a rise of 0.316 in world z comes out as -0.316
-        # in the rotated frame's y.
-        origin = transform(
-            quaternion_to_matrix(joint.origin_orientation).T,
-            joint.origin_position,
-        )
-        return parent_inertial @ origin
+        return transform(joint.origin_rotation, joint.origin_position)
 
     def _link_to_link(self, joint: JointSpec,
                       angle: Optional[torch.Tensor]) -> torch.Tensor:
@@ -289,10 +328,9 @@ def describe_chain(kinematics: ForwardKinematics) -> str:
              f"{kinematics.end_effector_link}:"]
     for joint in kinematics.joints:
         kind = "movable" if joint.movable else "fixed  "
-        offset = ", ".join(f"{v:+.3f}"
-                           for v in joint.parent_inertial_position)
+        offset = ", ".join(f"{v:+.3f}" for v in joint.origin_position)
         lines.append(f"  {joint.index:>3} {kind} {joint.name:<24} "
                      f"parent {joint.parent:>3}  "
-                     f"parent inertial offset ({offset})")
+                     f"urdf origin ({offset})")
     lines.append(f"inputs: {kinematics.movable_joints}")
     return "\n".join(lines)

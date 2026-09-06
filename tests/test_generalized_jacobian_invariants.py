@@ -11,8 +11,8 @@ import pybullet as p
 import pytest
 import torch
 
-from src.dynamics import FloatingBaseModel
-from src.freeflight import (ARM_JOINTS, BUS_GYRATION_SQUARED, END_EFFECTOR,
+from src.freeflight import (ARM_JOINTS, BUS_GYRATION_SQUARED, build_model,
+                            end_effector_index, to_base_link_axes,
                             FINGER_JOINTS, simulate_held_rates)
 
 DTYPE = torch.float64
@@ -21,8 +21,8 @@ ARM = len(ARM_JOINTS)
 
 def _bus_model(body, mass):
     inertia = mass * BUS_GYRATION_SQUARED
-    return FloatingBaseModel(body, ARM_JOINTS, base_mass=mass,
-                             base_inertia_diagonal=[inertia] * 3, dtype=DTYPE)
+    return build_model(body, base_mass=mass,
+                       base_inertia_diagonal=[inertia] * 3, dtype=DTYPE)
 
 
 def test_manipulator_jacobian_matches_pybullet_on_a_fixed_base(
@@ -34,7 +34,7 @@ def test_manipulator_jacobian_matches_pybullet_on_a_fixed_base(
         mine = model.manipulator_jacobian(
             torch.tensor(angles, dtype=DTYPE)).numpy()
         linear, angular = p.calculateJacobian(
-            panda_fixed, END_EFFECTOR, [0.0, 0.0, 0.0],
+            panda_fixed, end_effector_index(panda_fixed), [0.0, 0.0, 0.0],
             list(angles) + [0.0, 0.0], zeros, zeros)
         truth = np.vstack([np.asarray(linear)[:, :ARM],
                            np.asarray(angular)[:, :ARM]])
@@ -85,8 +85,7 @@ def test_a_mismatched_base_reference_point_is_rejected(panda_free,
     """H_b is written about the base link's inertial frame. Asking for J_g
     from a model built about a different point must fail loudly, since the
     two terms would be referenced to different places."""
-    other = FloatingBaseModel(panda_free, ARM_JOINTS,
-                              base_reference="system_com", dtype=DTYPE)
+    other = build_model(panda_free, base_reference="system_com", dtype=DTYPE)
     with pytest.raises(ValueError, match="base_com"):
         other.generalized_jacobian(torch.tensor(configurations[0], dtype=DTYPE))
 
@@ -104,6 +103,10 @@ def test_generalized_jacobian_predicts_the_simulated_end_effector_twist(
     for angles in configurations[:4]:
         rates = rng.uniform(-0.6, 0.6, size=ARM)
         measured = simulate_held_rates(panda_free, angles, rates)
+        # The simulation reports twists in world axes; the model produces
+        # them in base link axes. The same rotation only for a diagonal
+        # base inertia tensor.
+        measured["ee_twist"] = to_base_link_axes(panda_free, measured["ee_twist"])
 
         q = torch.tensor(measured["q"], dtype=DTYPE)
         qdot = torch.tensor(measured["qdot"], dtype=DTYPE)
@@ -125,6 +128,8 @@ def test_base_twist_predicts_the_simulated_base_twist(panda_free, model,
     for angles in configurations[:3]:
         rates = rng.uniform(-0.6, 0.6, size=ARM)
         measured = simulate_held_rates(panda_free, angles, rates)
+        measured["base_twist"] = to_base_link_axes(panda_free,
+                                                   measured["base_twist"])
 
         predicted = model.base_velocity(
             torch.tensor(measured["q"], dtype=DTYPE),

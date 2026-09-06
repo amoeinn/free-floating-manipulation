@@ -24,6 +24,12 @@ Usage:
 import numpy as np
 import pybullet as p
 import pybullet_data
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.freeflight import load_panda
 
 ARM_JOINTS = [0, 1, 2, 3, 4, 5, 6]
 
@@ -32,7 +38,7 @@ def audit_inertias() -> None:
     """One row per link, base link included, with a non-positive flag."""
     p.connect(p.DIRECT)
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
-    robot = p.loadURDF("franka_panda/panda.urdf", useFixedBase=False)
+    robot = load_panda(fixed_base=False)
 
     print("link inertia audit — franka_panda/panda.urdf, useFixedBase=False")
     print(f"{'idx':>3}  {'name':<22} {'mass (kg)':>10}  "
@@ -106,7 +112,7 @@ def mass_matrix_shape() -> None:
     for fixed in (True, False):
         p.connect(p.DIRECT)
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
-        robot = p.loadURDF("franka_panda/panda.urdf", useFixedBase=fixed)
+        robot = load_panda(fixed_base=fixed)
 
         movable = [j for j in range(p.getNumJoints(robot))
                    if p.getJointInfo(robot, j)[2] != p.JOINT_FIXED]
