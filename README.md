@@ -124,24 +124,26 @@ base motion over the path:             2.751 deg, 20.7 mm
   base free to react    COLLIDES, 1.36 mm penetration, panda_link6 against target_structure
 ```
 
-**The hazard is not that the base moves. It is that the base moves by more than the planner happened to leave.** Over 20 independent plans on the identical query, the margin the base reaction consumes is stable between 6 and 22 mm, while the clearance OMPL leaves swings between 0.5 and 17.3 mm. Fifteen of the twenty collide. What decides the outcome is the planner, not the dynamics.
+**The hazard is not that the base moves. It is that the base moves by more than the planner happened to leave.** Over 40 independent plans on the identical query, the margin the base reaction consumes has a middle half of 12.9 to 18.9 mm, while the clearance OMPL leaves ranges over its middle half from 1.5 to 17.3 mm, a spread more than twice as wide, and reaches down to 0.1 mm. Thirty two of the forty collide. What decides the outcome is the planner, not the dynamics. Two of the forty consumed more than 30 mm, where OMPL returned an unusually long path, so the consumed margin is the tighter of the two distributions rather than a constant.
 
 That is also why the effect cannot be provoked by asking for a larger motion. Widening the trajectory made OMPL route further from the structure, and the clearance it returned went from 17.3 mm to 63.5 and then 133.6 mm: a planner with room uses it, and nothing happens. **The hazard lives in constrained passages**, where the planner has no margin to spare, and that is precisely where a base aware check earns its place.
 
 The binding link is `panda_link6`, not the end effector. It sits closer to the base, where the lever arm on a base rotation is shorter, so estimating danger from end effector displacement overstates it: at 500 kg the end effector moves 27 mm over this reach while only 8 mm of margin is consumed at the link that actually matters.
 
-How much of this survives depends on the servicer, and the same scene and trajectory across bus masses says where the line falls. Twelve plans at each:
+How much of this survives depends on the servicer, and the same scene and trajectory across bus masses says where the line falls. Forty plans at each:
 
 | bus mass | plans colliding | base pitch |
 | --- | --- | --- |
-| 2300 kg, MEV-1 class | 1 of 12 | 0.30 deg |
-| 1000 kg | 2 of 12 | 0.55 deg |
-| 500 kg | 5 of 12 | 1.31 deg |
-| 300 kg | 4 of 12 | 2.18 deg |
-| 200 kg, ELSA-d class | 12 of 12 | 2.33 deg |
-| 150 kg | 11 of 12 | 4.70 deg |
+| 2300 kg, MEV-1 class | 4 of 40, 10% | 0.36 deg |
+| 1000 kg | 6 of 40, 15% | 0.64 deg |
+| 500 kg | 7 of 40, 18% | 1.35 deg |
+| 300 kg | 13 of 40, 32% | 2.05 deg |
+| 200 kg, ELSA-d class | 32 of 40, 80% | 2.77 deg |
+| 150 kg | 35 of 40, 88% | 3.30 deg |
 
-So this is a real hazard for a servicer of a few hundred kilograms and a marginal one for a heavy bus, on an ordinary planning clearance rather than a contrived one. Above about a tonne, producing a collision would need a gap built to fail, and that would be a demonstration of nothing.
+Forty rather than twelve because at twelve the 300 and 500 kg rows came out inverted, which is not physical: base reaction rises monotonically as the bus gets lighter, so the collision rate has to as well. Raising the sample resolved it rather than papering over it, and the ordering is now monotonic in both columns. The rate itself still carries sampling error of a few percent: a repeat of the 200 kg row returned 30 of 40 rather than 32.
+
+So this is a real hazard for a servicer of a few hundred kilograms and a marginal one for a heavy bus, on an ordinary planning clearance rather than a contrived one. It is not zero even at MEV-1 scale, where one plan in ten still clips, because OMPL sometimes returns a path with almost no margin. What changes with bus mass is how much of the planner's margin the reaction eats, and therefore how often an ordinary plan is unlucky enough to matter.
 
 One caveat on reproducibility. OMPL is not seedable through MoveIt's interface here: seeding `ompl::RNG` before the planner plugin loads and forcing a single planning attempt still returns 33, 16 and 22 waypoint paths for the same seed. The seed argument is kept and documented as insufficient rather than removed, and the distribution is reported rather than any single run, because reporting one run of a randomised planner would be selection.
 
