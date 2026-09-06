@@ -108,6 +108,43 @@ A 2,300 kg servicer of roughly MEV-1 scale still turns about a quarter of a degr
 
 The same limit seen through the Jacobian. The relative difference between J_g and J_m falls on a log log slope of minus 0.996 across five decades of bus mass. A heavy enough bus makes the free flyer a fixed base again, and J_g degrades gracefully into J_m rather than being a separate regime, which is the sanity property a formulation like this ought to have.
 
+### What a fixed base planner misses, and when it matters
+
+A planner that holds the base still is answering a different question from the one a free flyer needs answered. `ws/` carries a C++ component that walks an arm trajectory, integrates the base motion the dynamics imply, writes the result into the SRDF floating joint, and re-checks every state against the MoveIt planning scene.
+
+The demonstration is a 200 kg servicer reaching out from a folded pose to a grapple fixture beyond a piece of target structure. OMPL plans it in the ordinary way and MoveIt certifies the result. Both halves of the following are the result:
+
+```
+MoveIt's own verdict on it:            collision free
+clearance to the world, base fixed:    17.3 mm   (panda_link6 to target_structure)
+clearance to the world, base free:     -1.4 mm
+margin consumed by base reaction:      18.7 mm
+base motion over the path:             2.751 deg, 20.7 mm
+  base held fixed       no collision
+  base free to react    COLLIDES, 1.36 mm penetration, panda_link6 against target_structure
+```
+
+**The hazard is not that the base moves. It is that the base moves by more than the planner happened to leave.** Over 20 independent plans on the identical query, the margin the base reaction consumes is stable between 6 and 22 mm, while the clearance OMPL leaves swings between 0.5 and 17.3 mm. Fifteen of the twenty collide. What decides the outcome is the planner, not the dynamics.
+
+That is also why the effect cannot be provoked by asking for a larger motion. Widening the trajectory made OMPL route further from the structure, and the clearance it returned went from 17.3 mm to 63.5 and then 133.6 mm: a planner with room uses it, and nothing happens. **The hazard lives in constrained passages**, where the planner has no margin to spare, and that is precisely where a base aware check earns its place.
+
+The binding link is `panda_link6`, not the end effector. It sits closer to the base, where the lever arm on a base rotation is shorter, so estimating danger from end effector displacement overstates it: at 500 kg the end effector moves 27 mm over this reach while only 8 mm of margin is consumed at the link that actually matters.
+
+How much of this survives depends on the servicer, and the same scene and trajectory across bus masses says where the line falls. Twelve plans at each:
+
+| bus mass | plans colliding | base pitch |
+| --- | --- | --- |
+| 2300 kg, MEV-1 class | 1 of 12 | 0.30 deg |
+| 1000 kg | 2 of 12 | 0.55 deg |
+| 500 kg | 5 of 12 | 1.31 deg |
+| 300 kg | 4 of 12 | 2.18 deg |
+| 200 kg, ELSA-d class | 12 of 12 | 2.33 deg |
+| 150 kg | 11 of 12 | 4.70 deg |
+
+So this is a real hazard for a servicer of a few hundred kilograms and a marginal one for a heavy bus, on an ordinary planning clearance rather than a contrived one. Above about a tonne, producing a collision would need a gap built to fail, and that would be a demonstration of nothing.
+
+One caveat on reproducibility. OMPL is not seedable through MoveIt's interface here: seeding `ompl::RNG` before the planner plugin loads and forcing a single planning attempt still returns 33, 16 and 22 waypoint paths for the same seed. The seed argument is kept and documented as insufficient rather than removed, and the distribution is reported rather than any single run, because reporting one run of a randomised planner would be selection.
+
 ## Bugs found and fixed
 
 Six, and what they have in common is worth naming first. Every one was a silent substitution or an unstated convention that produced a plausible number rather than an error, and not one was found by reading code. Four were found by a second implementation or a second model disagreeing with the first.
@@ -226,6 +263,19 @@ python examples/verify_cpp_dynamics.py         # the C++ port against the torch 
 python examples/render_nonholonomy_gif.py      # the animation at the top of this file
 ```
 
+The trajectory validity checker and its demonstration are C++ and need the
+workspace built and sourced:
+
+```bash
+source ws/install/setup.bash
+ros2 run free_floating_manipulation servicing_demo \
+  ws/build/panda_identified.urdf /path/to/panda.srdf 200 20240904 20
+```
+
+The arguments are the URDF, an SRDF declaring a floating virtual joint, the bus
+mass in kg, an OMPL seed, and how many plans to sample. Twenty is a reasonable
+sample; one is a single draw from a randomised planner.
+
 `FFM_MODEL` selects the model: `identified` is the default and is Franka's published parameters, `pybullet` is the Panda that ships with PyBullet and is what phases 1 and 2 were measured on. Every script and every test runs against both.
 
 Run the tests with `pytest`. The two parameter sweeps are marked `slow` and left out of the default run; `pytest -m slow` runs those and `pytest -m "slow or not slow"` runs everything.
@@ -238,7 +288,7 @@ src/dynamics.py     floating base mass matrix, coupling inertia, generalized Jac
 src/freeflight.py   model selection, the joint loop, the zero gravity run, momentum
 examples/           one script per result, each printing a per item table
 tests/              32 invariants, each case named for what it protects
-ws/                 the C++ port, a colcon package reading the model through MoveIt
+ws/                 the C++ port and the trajectory validity checker, a colcon package
 docs/               figures, all regenerable from the scripts above
 ```
 
