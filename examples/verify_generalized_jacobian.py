@@ -38,12 +38,13 @@ import pybullet_data
 import torch
 
 from src.dynamics import FloatingBaseModel
-from src.freeflight import (BUS_GYRATION_SQUARED, disable_damping,
-                            simulate_held_rates)
+from src.freeflight import (BUS_GYRATION_SQUARED, build_model, disable_damping,
+                            end_effector_index, load_panda, simulate_held_rates,
+                            to_base_link_axes)
 
 ARM_JOINTS = [0, 1, 2, 3, 4, 5, 6]
 FINGER_JOINTS = [9, 10]
-END_EFFECTOR = 11
+END_EFFECTOR = None  # resolved from the selected model
 DTYPE = torch.float64
 FREE_BASE_POSITION = [0.0, 0.0, 20.0]
 # docs/ is the one PNG location .gitignore keeps.
@@ -54,11 +55,10 @@ def connect() -> tuple:
     p.connect(p.DIRECT)
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
     p.setGravity(0, 0, 0)
-    fixed_body = p.loadURDF("franka_panda/panda.urdf", useFixedBase=True)
+    fixed_body = load_panda(fixed_base=True)
     # Well clear of the fixed body: two Pandas at the same origin collide and
     # the free one is flung off at 100 m/s.
-    free_body = p.loadURDF("franka_panda/panda.urdf", useFixedBase=False,
-                           basePosition=FREE_BASE_POSITION)
+    free_body = load_panda(fixed_base=False, base_position=FREE_BASE_POSITION)
     disable_damping(free_body)
     return fixed_body, free_body
 
@@ -85,7 +85,7 @@ def check_manipulator_jacobian(fixed_body: int, model: FloatingBaseModel,
         mine = model.manipulator_jacobian(q).numpy()
 
         full = list(arm_angles) + [0.0, 0.0]
-        linear, angular = p.calculateJacobian(fixed_body, END_EFFECTOR,
+        linear, angular = p.calculateJacobian(fixed_body, end_effector_index(fixed_body),
                                               [0.0, 0.0, 0.0], full,
                                               zeros, zeros)
         truth = np.vstack([np.asarray(linear)[:, :len(ARM_JOINTS)],
@@ -113,6 +113,12 @@ def check_against_simulation(free_body: int, model: FloatingBaseModel,
         joint_rates = rng.uniform(-0.6, 0.6, size=len(ARM_JOINTS))
         measured = simulate_held_rates(free_body, arm_angles, joint_rates,
                                        base_position=FREE_BASE_POSITION)
+        # The simulation reports twists in world axes; the model produces them
+        # in base link axes, because the forward kinematics puts the base link
+        # frame at the identity. Identical only while the base inertia tensor
+        # is diagonal.
+        measured["ee_twist"] = to_base_link_axes(free_body, measured["ee_twist"])
+        measured["base_twist"] = to_base_link_axes(free_body, measured["base_twist"])
 
         q = torch.tensor(measured["q"], dtype=DTYPE)
         rates = torch.tensor(measured["qdot"], dtype=DTYPE)
@@ -158,9 +164,9 @@ def bus_sweep(free_body: int, configurations: np.ndarray) -> bool:
           f"{'||Jg-Jm||/||Jm||':>16}  {'|omega_b| / |qdot|':>18}")
     for mass in bus_masses:
         inertia = mass * gyration_squared
-        model = FloatingBaseModel(
-            free_body, ARM_JOINTS, base_mass=float(mass),
-            base_inertia_diagonal=[inertia, inertia, inertia], dtype=DTYPE)
+        model = build_model(free_body, base_mass=float(mass),
+                            base_inertia_diagonal=[inertia, inertia, inertia],
+                            dtype=DTYPE)
 
         errors = []
         couplings = []
@@ -264,7 +270,7 @@ def check_gradient(model: FloatingBaseModel, arm_angles: np.ndarray) -> bool:
 def main() -> None:
     fixed_body, free_body = connect()
     configurations = random_configurations(fixed_body, count=8, seed=0)
-    model = FloatingBaseModel(free_body, ARM_JOINTS, dtype=DTYPE)
+    model = build_model(free_body, dtype=DTYPE)
 
     ok0 = check_manipulator_jacobian(fixed_body, model, configurations)
     if not ok0:

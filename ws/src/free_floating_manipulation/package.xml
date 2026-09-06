@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>free_floating_manipulation</name>
+  <version>0.0.0</version>
+  <description>MoveIt 2 and BehaviorTree.CPP plugins for manipulating from a free-floating base, where arm motion reacts on the spacecraft and base attitude depends on the history of the trajectory.</description>
+  <maintainer email="moein.bme@gmail.com">amoeinn</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- The behavior tree that sequences the mission. -->
+  <depend>behaviortree_cpp</depend>
+
+  <!-- MoveIt 2, open source and installable from the public ROS 2 apt
+       repository, which is why phase 3 targets it rather than MoveIt Pro. -->
+  <depend>moveit_core</depend>
+  <depend>moveit_ros_planning</depend>
+  <depend>moveit_ros_planning_interface</depend>
+  <depend>moveit_msgs</depend>
+
+  <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>pluginlib</depend>
+  <depend>urdf</depend>
+  <depend>srdfdom</depend>
+  <depend>eigen</depend>
+
+  <!-- Robot description and planning config, needed at run time only. -->
+  <exec_depend>moveit_resources_panda_description</exec_depend>
+  <exec_depend>moveit_resources_panda_moveit_config</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

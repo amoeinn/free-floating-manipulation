@@ -35,6 +35,7 @@ import pybullet_data
 import torch
 
 from src.dynamics import FloatingBaseModel
+from src.freeflight import build_model, load_panda, panda_spec
 from src.kinematics import quaternion_to_matrix
 
 ARM_JOINTS = [0, 1, 2, 3, 4, 5, 6]
@@ -51,9 +52,8 @@ def load_both() -> tuple:
     """
     p.connect(p.DIRECT)
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
-    fixed_body = p.loadURDF("franka_panda/panda.urdf", useFixedBase=True)
-    free_body = p.loadURDF("franka_panda/panda.urdf", useFixedBase=False,
-                           basePosition=[10.0, 0.0, 0.0])
+    fixed_body = load_panda(fixed_base=True)
+    free_body = load_panda(fixed_base=False, base_position=(10.0, 0.0, 0.0))
     return fixed_body, free_body
 
 
@@ -100,8 +100,16 @@ def probe_conventions(body: int, model: FloatingBaseModel,
         except Exception as exception:  # noqa: BLE001 - reporting a probe
             print(f"  objPositions length {length}: rejected ({exception})")
 
+    # localPosition turns out to be expressed in the link's INERTIAL frame,
+    # measured from the link origin, so the centre of mass sits at
+    # R_inertial^T times the inertial offset. On a model whose inertial
+    # frames are all axis aligned that rotation is the identity and the bare
+    # offset works, which is why the earlier probe could not tell them apart.
     candidates = {"link_frame_origin": lambda info: [0.0, 0.0, 0.0],
                   "inertial_offset": lambda info: list(info[3]),
+                  "unrotated_inertial_offset": lambda info: list(
+                      np.asarray(p.getMatrixFromQuaternion(info[4])).reshape(3, 3).T
+                      @ np.asarray(info[3])),
                   "negated_inertial_offset": lambda info: [-c for c in info[3]]}
 
     rows = []
@@ -153,6 +161,9 @@ def stage_one(body: int, model: FloatingBaseModel,
     local_of = {
         "link_frame_origin": lambda info: [0.0, 0.0, 0.0],
         "inertial_offset": lambda info: list(info[3]),
+        "unrotated_inertial_offset": lambda info: list(
+            np.asarray(p.getMatrixFromQuaternion(info[4])).reshape(3, 3).T
+            @ np.asarray(info[3])),
         "negated_inertial_offset": lambda info: [-c for c in info[3]],
     }[local_frame]
 
@@ -255,6 +266,46 @@ SWAP[:3, 3:] = np.eye(3)
 SWAP[3:, :3] = np.eye(3)
 
 
+def diagonalisation_floor(body: int) -> float:
+    """How well PyBullet reproduces each declared inertia tensor.
+
+    It stores principal moments and the rotation that diagonalises them, so
+    R diag R^T should return the tensor the URDF declared. For a diagonal
+    input that is exact; for one with off-diagonal terms it is an eigensolve
+    and it is not, and nothing built on top of it can do better.
+    """
+    declared = panda_spec()["inertials"]
+    if declared is None:
+        return 1e-16
+    worst = 0.0
+    for link in range(-1, p.getNumJoints(body)):
+        info = p.getDynamicsInfo(body, link)
+        name = (p.getBodyInfo(body)[0].decode() if link == -1
+                else p.getJointInfo(body, link)[12].decode())
+        if info[0] == 0.0 or name not in declared:
+            continue
+        rotation = np.asarray(p.getMatrixFromQuaternion(info[4])).reshape(3, 3)
+        reconstructed = rotation @ np.diag(info[2]) @ rotation.T
+        worst = max(worst, float(np.abs(reconstructed - declared[name][3]).max()))
+    return max(worst, 1e-16)
+
+
+def base_axes(body: int) -> np.ndarray:
+    """6x6 rotation from base link axes into the base inertial axes.
+
+    PyBullet writes the base twist in the base link's inertial AXES, not
+    merely about that point. The rotation is the identity whenever the base
+    inertia tensor is diagonal, which is why sweeping reference points in
+    phase 2a settled the point and could not have settled the axes.
+    """
+    rotation = np.asarray(p.getMatrixFromQuaternion(
+        p.getDynamicsInfo(body, -1)[4])).reshape(3, 3)
+    block = np.zeros((6, 6))
+    block[:3, :3] = rotation
+    block[3:, 3:] = rotation
+    return block
+
+
 def stage_three(free_body: int, body_for_model: int,
                 configurations: np.ndarray) -> bool:
     print("stage 3: H_b and H_bm vs free-base calculateMassMatrix")
@@ -266,15 +317,16 @@ def stage_three(free_body: int, body_for_model: int,
     print(f"  {'reference':>18}   {'max |dH_b|':>12}   {'max |dH_bm|':>12}")
     results = {}
     for reference in references:
-        model = FloatingBaseModel(body_for_model, ARM_JOINTS,
-                                  base_reference=reference, dtype=DTYPE)
+        model = build_model(body_for_model, base_reference=reference,
+                            dtype=DTYPE)
         worst_hb = 0.0
         worst_hbm = 0.0
         for arm_angles in configurations:
             q = torch.tensor(arm_angles, dtype=DTYPE)
             base_inertia, coupling = model.coupling(q)
-            mine_hb = SWAP @ base_inertia.numpy() @ SWAP
-            mine_hbm = SWAP @ coupling.numpy()
+            axes = base_axes(free_body)
+            mine_hb = SWAP @ (axes.T @ base_inertia.numpy() @ axes) @ SWAP
+            mine_hbm = SWAP @ (axes.T @ coupling.numpy())
 
             full = full_configuration(arm_angles)
             truth = np.asarray(p.calculateMassMatrix(free_body, full))
@@ -288,14 +340,22 @@ def stage_three(free_body: int, body_for_model: int,
 
     best = min(results, key=lambda name: max(results[name]))
     worst_hb, worst_hbm = results[best]
-    passed = max(worst_hb, worst_hbm) < 1e-9
+
+    # The floor is not ours. PyBullet stores an inertia tensor as principal
+    # moments plus a rotation, so a model with off-diagonal terms comes back
+    # through an eigendecomposition and cannot be reproduced exactly. Measure
+    # that residual and judge against it rather than against a constant.
+    floor = diagonalisation_floor(free_body)
+    tolerance = max(1e-9, 50 * floor)
+    print(f"  PyBullet's own eigendecomposition of these tensors is good to "
+          f"{floor:.3e}, so the tolerance is {tolerance:.1e}")
+    passed = max(worst_hb, worst_hbm) < tolerance
     print(f"  -> PyBullet's base twist is written about {best}")
     print(f"     {'H_b and H_bm match' if passed else 'NO REFERENCE MATCHES'}\n")
 
     # ---- fingers folded vs exact, on the matching reference
     print("stage 3b: fingers=\"folded\" approximation vs \"exact\"")
-    model = FloatingBaseModel(body_for_model, ARM_JOINTS,
-                              base_reference=best, dtype=DTYPE)
+    model = build_model(body_for_model, base_reference=best, dtype=DTYPE)
     worst_hb = 0.0
     worst_hbm = 0.0
     for arm_angles in configurations:
@@ -318,8 +378,7 @@ def stage_three(free_body: int, body_for_model: int,
 
 def check_gradient(body: int, configuration: np.ndarray) -> None:
     print("gradient: M(q) is differentiable end to end")
-    model = FloatingBaseModel(body, ARM_JOINTS, base_reference="system_com",
-                              dtype=DTYPE)
+    model = build_model(body, base_reference="system_com", dtype=DTYPE)
     q = torch.tensor(configuration, dtype=DTYPE, requires_grad=True)
 
     def base_speed(configuration: torch.Tensor) -> torch.Tensor:
@@ -355,8 +414,8 @@ def main() -> None:
     # Stage 1 needs only the arm Jacobians, so the fixed-base body is fine
     # and simpler. Stages 2 and 3 need the base link's real mass, which
     # PyBullet only fills in under useFixedBase=False.
-    fixed_model = FloatingBaseModel(fixed_body, ARM_JOINTS, dtype=DTYPE)
-    free_model = FloatingBaseModel(free_body, ARM_JOINTS, dtype=DTYPE)
+    fixed_model = build_model(fixed_body, dtype=DTYPE)
+    free_model = build_model(free_body, dtype=DTYPE)
 
     local_frame = probe_conventions(fixed_body, fixed_model, configurations[0])[0]
     ok1 = stage_one(fixed_body, fixed_model, local_frame, configurations)

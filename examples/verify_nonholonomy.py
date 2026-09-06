@@ -41,6 +41,7 @@ import torch
 
 from src.dynamics import FloatingBaseModel
 from src.freeflight import (ARM_JOINTS, BUS_GYRATION_SQUARED, JointLoop,
+                            build_model, load_panda,
                             disable_damping, integrate_base_rotation,
                             rotation_angle, set_bus, simulate_loop)
 
@@ -119,7 +120,7 @@ def part_reversal(body: int) -> bool:
 
 def part_analytic(body: int) -> bool:
     print("part 4: analytic -H_b^-1 H_bm qdot integrated vs the simulation")
-    model = FloatingBaseModel(body, ARM_JOINTS, dtype=DTYPE)
+    model = build_model(body, dtype=DTYPE)
     truth_angle = np.degrees(simulate_loop(body, LOOP, dt=1.25e-4)["angle"])
 
     print(f"  {'frame':>8}  {'samples':>8}  {'net rotation (deg)':>18}  "
@@ -208,8 +209,7 @@ def main() -> None:
     p.connect(p.DIRECT)
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
     p.setGravity(0, 0, 0)
-    body = p.loadURDF("franka_panda/panda.urdf", useFixedBase=False,
-                      basePosition=[0, 0, 0])
+    body = load_panda(fixed_base=False)
     disable_damping(body)
 
     ok_momentum = part_nominal(body)

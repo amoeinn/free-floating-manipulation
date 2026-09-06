@@ -30,10 +30,11 @@ import pybullet as p
 import pybullet_data
 import torch
 
+from src.freeflight import end_effector_index, load_panda, panda_spec
 from src.kinematics import ForwardKinematics, describe_chain
 
 ARM_JOINTS = [0, 1, 2, 3, 4, 5, 6]
-END_EFFECTOR = 11
+END_EFFECTOR = None  # resolved from the selected model
 
 
 def pybullet_pose(body, link, configuration):
@@ -47,13 +48,15 @@ def pybullet_pose(body, link, configuration):
 def main() -> None:
     p.connect(p.DIRECT)
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
-    robot = p.loadURDF("franka_panda/panda.urdf", useFixedBase=True)
+    robot = load_panda(fixed_base=True)
+    end_effector = end_effector_index(robot)
 
     limits = [(p.getJointInfo(robot, j)[8], p.getJointInfo(robot, j)[9])
               for j in ARM_JOINTS]
 
-    kinematics = ForwardKinematics(robot, END_EFFECTOR,
-                                   movable_joints=ARM_JOINTS)
+    kinematics = ForwardKinematics(robot, end_effector,
+                                   movable_joints=ARM_JOINTS,
+                                   urdf=panda_spec()["urdf_path"])
     print(describe_chain(kinematics))
 
     # ------------------------------------------------------- pose agreement
@@ -65,7 +68,7 @@ def main() -> None:
     for _ in range(500):
         configuration = np.array([rng.uniform(lo, hi) for lo, hi in limits])
         truth_position, truth_orientation = pybullet_pose(
-            robot, END_EFFECTOR, configuration)
+            robot, end_effector, configuration)
 
         pose = kinematics(torch.tensor(configuration, dtype=torch.float64))
         mine_position = pose[:3, 3].numpy()
@@ -139,7 +142,7 @@ def main() -> None:
 
     began = time.perf_counter()
     for row in batch.numpy():
-        pybullet_pose(robot, END_EFFECTOR, row)
+        pybullet_pose(robot, end_effector, row)
     theirs = time.perf_counter() - began
 
     print(f"  200 poses in torch:    {mine * 1000:.1f} ms")

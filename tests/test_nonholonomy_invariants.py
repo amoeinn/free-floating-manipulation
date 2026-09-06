@@ -12,19 +12,19 @@ import pytest
 import torch
 
 from src.dynamics import FloatingBaseModel
-from src.freeflight import (ARM_JOINTS, JointLoop, disable_damping,
+from src.freeflight import (ARM_JOINTS, JointLoop, build_model, disable_damping,
+                            load_panda,
                             integrate_base_rotation, momentum_residual,
                             rotation_angle, set_bus, simulate_loop)
 
 DTYPE = torch.float64
-URDF = "franka_panda/panda.urdf"
 
 
 @pytest.fixture(scope="module")
 def analytic_rotation(panda_free, loop):
     """Net base rotation from integrating the model around the loop, in
     degrees. Module-scoped because it costs a few seconds."""
-    model = FloatingBaseModel(panda_free, ARM_JOINTS, dtype=DTYPE)
+    model = build_model(panda_free, dtype=DTYPE)
     return {
         frame: np.degrees(rotation_angle(
             integrate_base_rotation(model, loop, samples=80, frame=frame)))
@@ -110,7 +110,7 @@ def test_link_damping_must_be_zeroed_explicitly_not_left_to_the_default(
     number, quietly wrong. This case fails if disable_damping ever stops
     being called on the free-flight path.
     """
-    damped = p.loadURDF(URDF, useFixedBase=False, basePosition=[0, 0, 100])
+    damped = load_panda(fixed_base=False, base_position=(0, 0, 100))
     try:
         with_default_damping = np.degrees(
             simulate_loop(damped, loop, dt=2.5e-4,

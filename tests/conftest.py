@@ -27,11 +27,10 @@ import pybullet_data
 import pytest
 import torch
 
-from src.dynamics import FloatingBaseModel
-from src.freeflight import ARM_JOINTS, JointLoop, disable_damping
+from src.freeflight import (ARM_JOINTS, JointLoop, build_model, disable_damping,
+                            end_effector_index, load_panda)
 
 DTYPE = torch.float64
-URDF = "franka_panda/panda.urdf"
 
 
 @pytest.fixture(scope="session")
@@ -55,7 +54,7 @@ def panda_fixed(physics):
     Collision cleared: it shares the origin with the free body so that
     both agree with ForwardKinematics, and it must not push it around.
     """
-    body = p.loadURDF(URDF, useFixedBase=True, basePosition=[0, 0, 0])
+    body = load_panda(fixed_base=True)
     for link in range(-1, p.getNumJoints(body)):
         p.setCollisionFilterGroupMask(body, link, 0, 0)
     return body
@@ -64,7 +63,7 @@ def panda_fixed(physics):
 @pytest.fixture(scope="session")
 def panda_free(physics, panda_fixed):
     """A free-base Panda, damping zeroed, ready for free flight."""
-    body = p.loadURDF(URDF, useFixedBase=False, basePosition=[0, 0, 0])
+    body = load_panda(fixed_base=False)
     disable_damping(body)
     return body
 
@@ -87,7 +86,7 @@ def pristine_bus(request, urdf_bus):
 
 @pytest.fixture
 def model(panda_free):
-    return FloatingBaseModel(panda_free, ARM_JOINTS, dtype=DTYPE)
+    return build_model(panda_free, dtype=DTYPE)
 
 
 @pytest.fixture(scope="session")

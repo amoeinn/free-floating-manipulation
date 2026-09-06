@@ -10,7 +10,9 @@ import pybullet as p
 import pytest
 import torch
 
-from src.freeflight import ARM_JOINTS, END_EFFECTOR
+from src.freeflight import ARM_JOINTS, end_effector_index, panda_spec
+
+URDF_PATH = panda_spec()["urdf_path"]
 from src.kinematics import ForwardKinematics
 
 DTYPE = torch.float64
@@ -38,7 +40,8 @@ def test_analytic_chain_reproduces_every_link_pose(panda_fixed, configurations):
     """
     for link in range(p.getNumJoints(panda_fixed)):
         kinematics = ForwardKinematics(panda_fixed, link,
-                                       movable_joints=ARM_JOINTS, dtype=DTYPE)
+                                       movable_joints=ARM_JOINTS, urdf=URDF_PATH,
+                                       dtype=DTYPE)
         for angles in configurations:
             truth_position, truth_rotation = _pybullet_link_pose(
                 panda_fixed, link, angles)
@@ -49,22 +52,108 @@ def test_analytic_chain_reproduces_every_link_pose(panda_fixed, configurations):
                           - truth_rotation).max() < TOLERANCE, f"link {link}"
 
 
-def test_link_two_is_exact_where_an_untransposed_joint_origin_would_not_be(
-        panda_fixed, configurations):
-    """getJointInfo field 15 is the rotation from joint frame to parent
-    frame -- the inverse of what a forward chain composes.
+def _rotated_inertia(principal, rpy):
+    """A valid inertia tensor that is not diagonal.
 
-    Without the transpose the chain stays exact through link 1 and then
-    goes 632 mm wrong at link 2, because a rise of 0.316 in world z comes
-    out as -0.316 in the rotated frame's y. Link 2 is therefore the link
-    that decides whether the transpose is there.
+    Built by rotating a diagonal one rather than by inventing six numbers:
+    PyBullet rejects a tensor that is not positive definite or that breaks
+    the triangle inequality on its principal moments, silently zeroing it,
+    which would make the test below vacuous.
     """
-    kinematics = ForwardKinematics(panda_fixed, 2, movable_joints=ARM_JOINTS,
-                                   dtype=DTYPE)
-    for angles in configurations:
-        truth_position, _ = _pybullet_link_pose(panda_fixed, 2, angles)
-        pose = kinematics(torch.tensor(angles, dtype=DTYPE))
-        assert np.linalg.norm(pose[:3, 3].numpy() - truth_position) < TOLERANCE
+    roll, pitch, yaw = rpy
+    def about(angle, axis):
+        c, s = np.cos(angle), np.sin(angle)
+        if axis == "x":
+            return np.array([[1, 0, 0], [0, c, -s], [0, s, c]])
+        if axis == "y":
+            return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+        return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+    rotation = about(yaw, "z") @ about(pitch, "y") @ about(roll, "x")
+    return rotation @ np.diag(principal) @ rotation.T
+
+
+def _rotated_inertia_urdf() -> str:
+    """A three link chain whose every link has off-diagonal inertia."""
+    links = [
+        ("base", 2.0, (0.01, -0.02, 0.03), (0.20, 0.25, 0.30), (0.3, -0.4, 0.5)),
+        ("upper", 1.5, (-0.04, 0.05, 0.06), (0.16, 0.18, 0.22), (-0.6, 0.2, 0.9)),
+        ("lower", 1.0, (0.02, 0.03, -0.05), (0.11, 0.12, 0.15), (0.7, 0.5, -0.3)),
+    ]
+    body = ['<?xml version="1.0"?>', '<robot name="rotated">']
+    for name, mass, com, principal, rpy in links:
+        i = _rotated_inertia(np.array(principal), rpy)
+        body += [
+            f'  <link name="{name}">', '    <inertial>',
+            f'      <origin xyz="{com[0]} {com[1]} {com[2]}" rpy="0 0 0"/>',
+            f'      <mass value="{mass}"/>',
+            f'      <inertia ixx="{float(i[0,0]):.17g}" ixy="{float(i[0,1]):.17g}"'
+            f' ixz="{float(i[0,2]):.17g}" iyy="{float(i[1,1]):.17g}"'
+            f' iyz="{float(i[1,2]):.17g}" izz="{float(i[2,2]):.17g}"/>',
+            '    </inertial>', '  </link>']
+    body += [
+        '  <joint name="shoulder" type="revolute">',
+        '    <parent link="base"/><child link="upper"/>',
+        '    <origin xyz="0 0 0.4" rpy="0.3 -0.2 0.5"/>',
+        '    <axis xyz="0 0 1"/>',
+        '    <limit lower="-3" upper="3" effort="10" velocity="1"/>',
+        '  </joint>',
+        '  <joint name="elbow" type="revolute">',
+        '    <parent link="upper"/><child link="lower"/>',
+        '    <origin xyz="0.1 -0.05 0.3" rpy="-0.4 0.6 0.1"/>',
+        '    <axis xyz="0 1 0"/>',
+        '    <limit lower="-3" upper="3" effort="10" velocity="1"/>',
+        '  </joint>', '</robot>']
+    return "\n".join(body)
+
+
+def test_chain_holds_when_the_inertial_frames_are_rotated(physics, tmp_path):
+    """The chain must not depend on how PyBullet stores inertial frames.
+
+    An earlier version composed the parent's inertial offset forward to
+    recover link frames, reading it out of getJointInfo. That agreed with
+    getLinkState to 5.7e-8 on the Panda and was wrong anyway: it is correct
+    only while every inertial frame is axis aligned with its link frame,
+    which is true of the Panda URDF PyBullet ships and is not a property of
+    robots in general. PyBullet rotates a link's inertial frame as soon as
+    that link's inertia tensor has off-diagonal terms, because it stores
+    principal moments plus the rotation that diagonalises them, and the old
+    chain then went 137 mm wrong at the second joint.
+
+    The gap was coverage, not code. This model has off-diagonal terms on
+    every link precisely so the rotation is there to be got wrong.
+    """
+    path = tmp_path / "rotated.urdf"
+    path.write_text(_rotated_inertia_urdf())
+    # At the origin, because the chain is built from the base frame outward
+    # and getLinkState reports world coordinates. This model declares no
+    # collision geometry, so sharing the origin with the fixtures is safe.
+    body = p.loadURDF(str(path), useFixedBase=True, basePosition=[0, 0, 0],
+                      flags=p.URDF_USE_INERTIA_FROM_FILE)
+    joints = [0, 1]
+
+    # Vacuous unless PyBullet really did rotate them, which it will not do if
+    # it rejected the tensors as unphysical and quietly zeroed them.
+    rotations = [np.abs(np.asarray(p.getDynamicsInfo(body, link)[4])
+                        - np.array([0.0, 0.0, 0.0, 1.0])).max()
+                 for link in (-1, 0, 1)]
+    assert max(rotations) > 0.05, (
+        f"no inertial frame is rotated ({rotations}), so this would pass "
+        "against the very bug it exists to catch")
+
+    rng = np.random.default_rng(3)
+    for link in joints:
+        kinematics = ForwardKinematics(body, link, movable_joints=joints,
+                                       urdf=str(path), dtype=DTYPE)
+        for _ in range(8):
+            angles = rng.uniform(-2.5, 2.5, size=len(joints))
+            for joint, angle in zip(joints, angles):
+                p.resetJointState(body, joint, float(angle))
+            truth = np.asarray(p.getLinkState(
+                body, link, computeForwardKinematics=True)[4])
+            mine = kinematics(torch.tensor(angles, dtype=DTYPE))[:3, 3].numpy()
+            assert np.abs(mine - truth).max() < TOLERANCE, f"link {link}"
+
+    p.removeBody(body)
 
 
 def test_joint_frames_end_pose_agrees_with_the_composed_chain(
@@ -73,8 +162,9 @@ def test_joint_frames_end_pose_agrees_with_the_composed_chain(
     world axis. Its end pose must still be the pose the chain composes, or
     the geometric Jacobian is anchored to frames the FK does not agree with.
     """
-    kinematics = ForwardKinematics(panda_fixed, END_EFFECTOR,
-                                   movable_joints=ARM_JOINTS, dtype=DTYPE)
+    kinematics = ForwardKinematics(panda_fixed, end_effector_index(panda_fixed),
+                                   movable_joints=ARM_JOINTS, urdf=URDF_PATH,
+                                       dtype=DTYPE)
     for angles in configurations:
         q = torch.tensor(angles, dtype=DTYPE)
         _, end_pose = kinematics.joint_frames(q)
@@ -87,8 +177,9 @@ def test_joint_axes_are_unit_and_reach_the_world_through_the_origins(
     a bug: the origin quaternions rotate each joint frame so its axis lies
     along z. The world axes must still come out unit length and distinct.
     """
-    kinematics = ForwardKinematics(panda_fixed, END_EFFECTOR,
-                                   movable_joints=ARM_JOINTS, dtype=DTYPE)
+    kinematics = ForwardKinematics(panda_fixed, end_effector_index(panda_fixed),
+                                   movable_joints=ARM_JOINTS, urdf=URDF_PATH,
+                                       dtype=DTYPE)
     frames, _ = kinematics.joint_frames(
         torch.tensor(configurations[0], dtype=DTYPE))
     assert sorted(frames) == list(ARM_JOINTS)
@@ -102,8 +193,9 @@ def test_position_jacobian_matches_a_finite_difference(panda_fixed,
     """Autograd's derivative of the chain must equal a finite difference of
     the same chain. Catches a chain that is right at the sampled poses and
     differentiates wrongly."""
-    kinematics = ForwardKinematics(panda_fixed, END_EFFECTOR,
-                                   movable_joints=ARM_JOINTS, dtype=DTYPE)
+    kinematics = ForwardKinematics(panda_fixed, end_effector_index(panda_fixed),
+                                   movable_joints=ARM_JOINTS, urdf=URDF_PATH,
+                                       dtype=DTYPE)
     step = 1e-6
     for angles in configurations[:2]:
         analytic = kinematics.jacobian(torch.tensor(angles, dtype=DTYPE)).numpy()
