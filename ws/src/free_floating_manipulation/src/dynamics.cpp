@@ -50,7 +50,9 @@ Eigen::Matrix3d skew(const Eigen::Vector3d& v)
 
 FloatingBaseModel::FloatingBaseModel(const moveit::core::RobotModelConstPtr& model,
                                      const std::vector<std::string>& arm_joints,
-                                     const std::string& end_effector_link)
+                                     const std::string& end_effector_link,
+                                     double base_mass,
+                                     const Eigen::Vector3d& base_inertia_diagonal)
   : model_(model), arm_joints_(arm_joints)
 {
   const auto& urdf_model = model_->getURDF();
@@ -108,10 +110,16 @@ FloatingBaseModel::FloatingBaseModel(const moveit::core::RobotModelConstPtr& mod
       entry.inertia = inertiaTensor(*urdf_link->inertial);
     }
     entry.arm_ancestors = ancestors_of(link);
-    links_.push_back(entry);
 
     if (link == base_link_)
+    {
+      if (base_mass > 0.0)
+        entry.mass = base_mass;
+      if ((base_inertia_diagonal.array() > 0.0).all())
+        entry.inertia = base_inertia_diagonal.asDiagonal();
       base_inertial_transform_ = entry.inertial_transform;
+    }
+    links_.push_back(entry);
   }
 
   end_effector_ancestors_ = ancestors_of(end_effector_);

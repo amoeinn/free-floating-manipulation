@@ -25,6 +25,7 @@
   <depend>urdf</depend>
   <depend>srdfdom</depend>
   <depend>eigen</depend>
+  <depend>ompl</depend>
 
   <!-- Robot description and planning config, needed at run time only. -->
   <exec_depend>moveit_resources_panda_description</exec_depend>

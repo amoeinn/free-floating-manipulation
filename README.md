@@ -205,8 +205,12 @@ The C++ workspace, if you want it:
 
 ```bash
 source /opt/ros/jazzy/setup.bash
-colcon build --base-paths ws
+colcon build --base-paths ws --build-base ws/build --install-base ws/install
 ```
+
+The build and install bases are pinned because `--base-paths` only says where
+to look for packages; without them colcon writes `build/`, `install/` and
+`log/` into whatever directory you happen to be standing in.
 
 ## Running it
 

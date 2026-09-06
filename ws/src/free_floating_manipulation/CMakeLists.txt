@@ -28,12 +28,13 @@ find_package(Eigen3 REQUIRED)
 message(STATUS "BehaviorTree.CPP ${behaviortree_cpp_VERSION}")
 message(STATUS "MoveIt core      ${moveit_core_VERSION}")
 
-add_library(free_floating_dynamics SHARED src/dynamics.cpp)
+add_library(free_floating_dynamics SHARED src/dynamics.cpp src/trajectory_validity.cpp)
 target_include_directories(free_floating_dynamics PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 target_link_libraries(free_floating_dynamics PUBLIC Eigen3::Eigen)
 ament_target_dependencies(free_floating_dynamics PUBLIC moveit_core urdf srdfdom)
+target_link_libraries(free_floating_dynamics PUBLIC ${moveit_core_LIBRARIES})
 
 # Writes the dynamics over a set of configurations so the Python
 # implementation can be compared against it block by block.
@@ -47,7 +48,17 @@ install(TARGETS free_floating_dynamics
   LIBRARY DESTINATION lib
   ARCHIVE DESTINATION lib
   RUNTIME DESTINATION bin)
-install(TARGETS dump_dynamics DESTINATION lib/${PROJECT_NAME})
+add_executable(servicing_demo src/servicing_demo.cpp)
+target_link_libraries(servicing_demo free_floating_dynamics)
+# OMPL is pulled in for one call, RNG::setSeed, so the demonstration is
+# repeatable. MoveIt exposes no seed of its own.
+find_package(ompl REQUIRED)
+target_include_directories(servicing_demo PRIVATE ${OMPL_INCLUDE_DIRS})
+target_link_libraries(servicing_demo ${OMPL_LIBRARIES})
+ament_target_dependencies(servicing_demo moveit_core moveit_ros_planning rclcpp
+  pluginlib urdf srdfdom geometry_msgs moveit_msgs)
+
+install(TARGETS dump_dynamics servicing_demo DESTINATION lib/${PROJECT_NAME})
 
 ament_export_include_directories(include)
 ament_export_libraries(free_floating_dynamics)
