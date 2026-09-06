@@ -2,9 +2,9 @@
 
 Manipulation planning for an arm on an uncontrolled free floating base, with on orbit satellite servicing as the driving case: a servicer with its thrusters off and its wheels idle, moving its arm toward a target it has not yet grappled. A fixed base arm pushes against the world for free, because every reaction torque a joint generates is absorbed by the floor. Take the floor away and the reaction has nowhere to go but the spacecraft, so the base translates and rotates in response to every joint motion and base attitude ends up depending on the entire history of arm motion rather than on where the joints currently are.
 
-![A free-floating Panda walks a closed loop in joint space; the joints return to their starting angles and the base ends 18.98 degrees rotated](docs/closed_loop.gif)
+![A free-floating Panda walks a closed loop in joint space; the joints come back to their starting angles and the base ends 18.98 degrees rotated](docs/closed_loop.gif)
 
-Two joints trace a circle in joint space and return to exactly the angles they started at. The base does not return. The consequence is not a correction term: the map from configuration to end effector pose stops being a function of configuration at all, because two paths that start and end at the same seven joint angles put the gripper in two different places. Every fixed base planner assumes that map exists. This repository builds the objects that replace it, measures how large the effect is, and then builds the whole thing a second time in C++ to find out what the first version had got wrong.
+Two joints trace a circle in joint space and come back to the angles they started at, to within 4.71e-04 rad. The base does not come back. The consequence is not a correction term: the map from configuration to end effector pose stops being a function of configuration at all, because two paths that start and end at the same seven joint angles put the gripper in two different places. Every fixed base planner assumes that map exists. This repository builds the objects that replace it, measures how large the effect is, and then builds the whole thing a second time in C++ to find out what the first version had got wrong.
 
 ## What is here
 
@@ -60,7 +60,9 @@ J_g has no reference implementation anywhere, so it is validated three ways that
 
 ### A closed loop in joint space leaves the base rotated
 
-Two joints trace a circle of amplitude 0.6 rad over 2 s and return every angle to its starting value, closing to 4.71e-04 rad. On a fixed base the arm would be exactly where it started. On the 17.59 kg free floating servicer it ends 18.9798 degrees rotated, about an axis of [-0.071, 0.006, -0.323]. The base swings well past that during the loop and comes most of the way back, but not all of it.
+Two joints trace a circle of amplitude 0.6 rad over 2 s and come back to their starting angles. The loop does not close exactly: position control leaves a residual of 4.71e-04 rad on the worst joint, which is worth stating rather than rounding to zero. On a fixed base the arm would be back where it started. On the 17.59 kg free floating servicer it ends 18.9798 degrees rotated, which is 0.331 rad, about an axis of [-0.071, 0.006, -0.323]. The base swings well past that during the loop and comes most of the way back, but not all of it.
+
+The residual is about 700 times smaller than the rotation it would have to explain, so it cannot account for the result, and it behaves differently under refinement. Halving the timestep halves the residual, 3.77e-03 then 1.89e-03 then 9.42e-04 then 4.71e-04, which is first order and heading to zero. The rotation over the same refinement goes 18.9670, 18.9742, 18.9779, 18.9798, converging on a value that is not zero. A rotation caused by the loop failing to close would follow the residual down.
 
 That is the whole claim in one number, so the work is in showing it is physics and not the integrator sliding.
 
@@ -72,6 +74,27 @@ That is the whole claim in one number, so the work is in showing it is physics a
 | Momentum conservation | peak total momentum along the loop is 6.37e-03 of its own scale at dt = 1e-3 and 1.59e-03 at 2.5e-4, falling by 4.0x for a 4x smaller step, so it is the stepper and not a leak. |
 
 Three of those four are arguments a wrong answer could not survive, and they fail in different ways. Timestep refinement catches an integrator artifact. Sign reversal catches anything that accumulates rather than closing. The RK4 comparison catches an error in the simulation rather than in the model.
+
+### The same loop on two different robots
+
+The number depends on the model, and how much is worth being explicit about. Run the identical loop on PyBullet's Panda, whose inertias it derives from the collision meshes because the file's declared values are a placeholder, and the base ends 10.02 degrees rotated. Run it on Franka's published identified parameters and it ends 18.98. Link 1 alone is 2.70 kg on the first and 4.97 kg on the second, and the identified model puts much more mass outboard.
+
+So the magnitude of the effect depends strongly on the mass distribution, which is what the theory says it should: J_g contains H_b^-1 H_bm, and that is exactly a statement about where the mass is. What does not change is everything structural.
+
+| | PyBullet, mesh derived | Franka, identified |
+| --- | --- | --- |
+| net base rotation | 10.0238 deg | 18.9798 deg |
+| link 1 mass | 2.70 kg | 4.97 kg |
+| timestep independence | converges, 0.43 percent spread | converges, 0.07 percent spread |
+| sign reversal, axis alignment | minus 1.000 | minus 1.000 |
+| composed forward and backward | 0.0058 deg | 0.0131 deg |
+| analytic RK4 vs simulation | 0.02 percent | 0.01 percent |
+| amplitude slope | 1.94 | 1.94 |
+| bus inertia slope | minus 0.99 | minus 0.98 |
+
+That matters more than either number. A result that reproduces across two different mass distributions is evidence that the phenomenon is real rather than an artifact of one model's parameters, and the two here are not small perturbations of each other: the masses differ by a factor of two on individual links and the inertia tensors are diagonal in one and not in the other. The nonholonomy survives that unchanged in every respect except its size, and its size moves in the direction and roughly the proportion the mass change predicts.
+
+The identified parameters are canonical for the same reason they are more useful: they are the ones Franka published for the real arm, and the other set is a placeholder in the file plus whatever PyBullet inferred from mesh geometry. Both are kept, and every script and test runs against either, because a suite that only ever sees one model cannot tell a convention from a coincidence. Three of the six bugs below were found exactly that way.
 
 ### How large the effect is, across buses
 
