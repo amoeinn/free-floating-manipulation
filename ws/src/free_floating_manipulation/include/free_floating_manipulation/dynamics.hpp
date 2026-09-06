@@ -74,9 +74,17 @@ public:
   ///        script for what that means in practice.
   /// \param arm_joints the joints treated as generalized coordinates, in order
   /// \param end_effector_link the link J_g is written for
+  /// \param base_mass if positive, replaces the base link's mass. This is
+  ///        the spacecraft bus, which the URDF does not carry: the base link
+  ///        of an arm model is a mounting flange, not a servicer.
+  /// \param base_inertia_diagonal if all positive, replaces the base link's
+  ///        inertia with that diagonal.
   FloatingBaseModel(const moveit::core::RobotModelConstPtr& model,
                     const std::vector<std::string>& arm_joints,
-                    const std::string& end_effector_link);
+                    const std::string& end_effector_link,
+                    double base_mass = -1.0,
+                    const Eigen::Vector3d& base_inertia_diagonal =
+                        Eigen::Vector3d::Constant(-1.0));
 
   std::size_t dofs() const { return arm_joints_.size(); }
   const std::vector<LinkInertia>& links() const { return links_; }
