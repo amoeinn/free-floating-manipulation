@@ -124,26 +124,31 @@ base motion over the path:             2.751 deg, 20.7 mm
   base free to react    COLLIDES, 1.36 mm penetration, panda_link6 against target_structure
 ```
 
-**The hazard is not that the base moves. It is that the base moves by more than the planner happened to leave.** Over 40 independent plans on the identical query, the margin the base reaction consumes has a middle half of 12.9 to 18.9 mm, while the clearance OMPL leaves ranges over its middle half from 1.5 to 17.3 mm, a spread more than twice as wide, and reaches down to 0.1 mm. Thirty two of the forty collide. What decides the outcome is the planner, not the dynamics. Two of the forty consumed more than 30 mm, where OMPL returned an unusually long path, so the consumed margin is the tighter of the two distributions rather than a constant.
+**The hazard is not that the base moves. It is that the base moves by more than the planner happened to leave.** Over 40 independent plans on the identical query at 200 kg, every one of them collision free with the base held still, the margin the base reaction consumes has a median of 16.8 mm and a middle half of 13.7 to 18.5. The clearance OMPL leaves has the same median, 17.3 mm, but a middle half of 11.8 to 17.3 and a tail reaching down to 0.6 mm. Thirty of the forty collide. What decides the outcome is the planner, not the dynamics: the reaction is about the size of the entire margin an ordinary plan leaves, so whether a given plan survives turns on how much clearance OMPL happened to return. Two of the forty consumed more than 30 mm, where OMPL returned an unusually long path.
 
 That is also why the effect cannot be provoked by asking for a larger motion. Widening the trajectory made OMPL route further from the structure, and the clearance it returned went from 17.3 mm to 63.5 and then 133.6 mm: a planner with room uses it, and nothing happens. **The hazard lives in constrained passages**, where the planner has no margin to spare, and that is precisely where a base aware check earns its place.
 
-The binding link is `panda_link6`, not the end effector. It sits closer to the base, where the lever arm on a base rotation is shorter, so estimating danger from end effector displacement overstates it: at 500 kg the end effector moves 27 mm over this reach while only 8 mm of margin is consumed at the link that actually matters.
+The binding link is `panda_link6` in most draws and `panda_link5` in the rest, never the end effector. The reason is not that it sits closer to the base. Measured along this path, `panda_link6` and `panda_hand` are 638 and 583 mm from the base at the start and 929 and 905 mm at the goal, within 3 to 9 percent of each other throughout, so distance from the base does not separate them. What makes an estimate taken at the end effector overstate the danger is that base displacement is an upper bound on margin loss rather than a measure of it: only the component normal to the obstacle face consumes clearance and the rest is motion along it. At 500 kg the base moves 1.248 deg and 9.0 mm over the path, which sweeps roughly 20 mm at link 6, while the margin actually consumed there is 7.7 mm. Which link supplies the minimum is a geometric question the dynamics cannot answer, which is why the check is run against the scene rather than estimated off the base twist.
 
-How much of this survives depends on the servicer, and the same scene and trajectory across bus masses says where the line falls. Forty plans at each:
+How much of this survives depends on the servicer. Forty plans at each bus mass, on the same scene and the same query, every one of them collision free with the base held still:
 
-| bus mass | plans colliding | base pitch |
-| --- | --- | --- |
-| 2300 kg, MEV-1 class | 4 of 40, 10% | 0.36 deg |
-| 1000 kg | 6 of 40, 15% | 0.64 deg |
-| 500 kg | 7 of 40, 18% | 1.35 deg |
-| 300 kg | 13 of 40, 32% | 2.05 deg |
-| 200 kg, ELSA-d class | 32 of 40, 80% | 2.77 deg |
-| 150 kg | 35 of 40, 88% | 3.30 deg |
+| bus mass | margin consumed, median | plans colliding | of the plans OMPL left at 17.3 mm |
+| --- | --- | --- | --- |
+| 2300 kg, MEV-1 class | 1.7 mm | 8 of 40 | 0 of 20 |
+| 1000 kg | 3.8 mm | 10 of 40 | 0 of 19 |
+| 500 kg | 7.7 mm | 8 of 40 | 0 of 21 |
+| 300 kg | 12.1 mm | 9 of 40 | 0 of 23 |
+| 250 kg | 14.6 mm | 17 of 40 | 1 of 18 |
+| 200 kg, ELSA-d class | 16.8 mm | 30 of 40 | 14 of 24 |
+| 150 kg | 18.8 mm | 37 of 40 | 17 of 20 |
 
-Forty rather than twelve because at twelve the 300 and 500 kg rows came out inverted, which is not physical: base reaction rises monotonically as the bus gets lighter, so the collision rate has to as well. Raising the sample resolved it rather than papering over it, and the ordering is now monotonic in both columns. The rate itself still carries sampling error of a few percent: a repeat of the 200 kg row returned 30 of 40 rather than 32.
+The consumed margin is the physics, and it is monotone across the whole range because the dynamics set it once a path is given. The collision rate is not. It tracks bus mass down to about 250 kg and then flattens at 8 to 10 in 40, which is not a floor in the dynamics but planner scatter: OMPL leaves its modal 17.3 mm on a majority of draws, its tail reaches 0.1 mm, and a path with nothing to spare collides at any bus mass. Above 300 kg not one of the modal plans collides, so every remaining failure comes from that tail rather than from base reaction being large.
 
-So this is a real hazard for a servicer of a few hundred kilograms and a marginal one for a heavy bus, on an ordinary planning clearance rather than a contrived one. It is not zero even at MEV-1 scale, where one plan in ten still clips, because OMPL sometimes returns a path with almost no margin. What changes with bus mass is how much of the planner's margin the reaction eats, and therefore how often an ordinary plan is unlucky enough to matter.
+The crossing is a prediction rather than a description of the data. The reaction eats the modal 17.3 mm below about 250 kg and does not above it, so the modal plans ought to go from mostly failing to not failing across that row. The 250 kg row was run after the others to test exactly that, and it landed where the consumed margin said it would: 1 of 18 modal plans, against 14 of 24 at 200 kg and none at 300.
+
+An earlier version of this table reported collision rates alone and was monotone across all six masses, at 4, 6, 7, 13, 32 and 35 of 40 from 2300 kg down to 150. That table was not reproducible. Rerunning the same command gives 8, 10, 8, 9, 30 and 37, flat above 300 kg rather than monotone. The variance at n = 40 is several plans wide and the monotone version was one draw of it. Raising the sample from 12 to 40 had removed a visible inversion between two rows without removing what caused it, which is that the collision rate stops depending on bus mass once the reaction is smaller than the margin a typical plan leaves. The consumed margin column reproduces because it does not depend on which path came back.
+
+So this is a real hazard for a servicer of a few hundred kilograms and a marginal one for a heavy bus, on an ordinary planning clearance rather than a contrived one. It never falls to zero, because OMPL sometimes returns a path with almost no margin and that fails at any mass. What bus mass changes is whether an ordinary plan is at risk at all.
 
 One caveat on reproducibility. OMPL is not seedable through MoveIt's interface here: seeding `ompl::RNG` before the planner plugin loads and forcing a single planning attempt still returns 33, 16 and 22 waypoint paths for the same seed. The seed argument is kept and documented as insufficient rather than removed, and the distribution is reported rather than any single run, because reporting one run of a randomised planner would be selection.
 
