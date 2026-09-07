@@ -112,17 +112,22 @@ The same limit seen through the Jacobian. The relative difference between J_g an
 
 A planner that holds the base still is answering a different question from the one a free flyer needs answered. `ws/` carries a C++ component that walks an arm trajectory, integrates the base motion the dynamics imply, writes the result into the SRDF floating joint, and re-checks every state against the MoveIt planning scene.
 
-The demonstration is a 200 kg servicer reaching out from a folded pose to a grapple fixture beyond a piece of target structure. OMPL plans it in the ordinary way and MoveIt certifies the result. Both halves of the following are the result:
+The demonstration is a 200 kg servicer reaching out from a folded pose to a grapple fixture beyond a piece of target structure. OMPL plans it in the ordinary way and MoveIt certifies the result. OMPL is randomised and returns a different path on every call, so what follows is the modal draw rather than a run: 24 of 40 plans leave exactly this clearance. A single draw of a randomised planner is a sample, and the two ways a plan fails here fail differently, so quoting one draw as the result would misrepresent the system. Both halves of the modal case are the result:
 
 ```
+the modal plan, the clearance 24 of 40 draws leave
 MoveIt's own verdict on it:            collision free
-clearance to the world, base fixed:    17.3 mm   (panda_link6 to target_structure)
-clearance to the world, base free:     -1.4 mm
-margin consumed by base reaction:      18.7 mm
-base motion over the path:             2.751 deg, 20.7 mm
+clearance to the world, base fixed:    17.3 mm
+clearance to the world, base free:     -0.8 mm   (panda_link6 to target_structure)
+margin consumed by base reaction:      18.2 mm
+base motion over the path:             2.645 deg, 20.7 mm
   base held fixed       no collision
-  base free to react    COLLIDES, 1.36 mm penetration, panda_link6 against target_structure
+  base free to react    COLLIDES, 0.81 mm penetration, panda_link6 against target_structure
 ```
+
+That case is marginal rather than emphatic, and it should be: across the 24 modal draws the free clearance has a median of -0.3 mm and 14 of them collide. The reaction and the margin are the same size, so which side of zero a given plan lands on is close to a coin toss.
+
+The other failure mode is the tail, and it is a different thing. OMPL occasionally returns a path that leaves under a millimetre to begin with: one draw here left 0.8 mm and ended 1.57 mm into the structure on `panda_link5`. That mode barely involves the dynamics. Even a 2,300 kg servicer consumes 1.7 mm on this trajectory, which is more than such a plan has, so it fails at every bus mass in the table below. Keeping the two apart is what that table's last column is for.
 
 **The hazard is not that the base moves. It is that the base moves by more than the planner happened to leave.** Over 40 independent plans on the identical query at 200 kg, every one of them collision free with the base held still, the margin the base reaction consumes has a median of 16.8 mm and a middle half of 13.7 to 18.5. The clearance OMPL leaves has the same median, 17.3 mm, but a middle half of 11.8 to 17.3 and a tail reaching down to 0.6 mm. Thirty of the forty collide. What decides the outcome is the planner, not the dynamics: the reaction is about the size of the entire margin an ordinary plan leaves, so whether a given plan survives turns on how much clearance OMPL happened to return. Two of the forty consumed more than 30 mm, where OMPL returned an unusually long path.
 
