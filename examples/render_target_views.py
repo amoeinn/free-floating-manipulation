@@ -102,12 +102,15 @@ def main():
         raise SystemExit("a visible surface faces away from the camera")
 
     print("\nrendering")
-    images, depths, poses, hits = [], [], [], []
+    images, depths, poses, hits, parts = [], [], [], [], []
     for cam in cameras:
         out = scene.render(cam)
         images.append(out["image"])
         depths.append(out["depth"])
         hits.append(out["hit"])
+        # Which primitive each pixel saw. Only ever used to report where a
+        # reconstruction succeeds and where it does not, never to fit.
+        parts.append(scene.render(cam, shadows=False)["primitive"])
         poses.append(np.concatenate([cam.R.ravel(), cam.t]))
     images = np.asarray(images, np.float32)
     depths = np.asarray(depths, np.float32)
@@ -146,6 +149,8 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         OUT / "views.npz", images=images, depths=depths, hits=hits,
+        primitive=np.asarray(parts, np.int8),
+        primitive_names=np.array([p.name for p in client_satellite()]),
         poses=np.asarray(poses), width=RESOLUTION, height=RESOLUTION,
         fx=cameras[0].fx, fy=cameras[0].fy, cx=cameras[0].cx, cy=cameras[0].cy,
         bounding_radius=radius)
