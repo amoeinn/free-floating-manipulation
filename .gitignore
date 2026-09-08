@@ -18,3 +18,5 @@ data/*.npz
 # The approach dataset is regenerable from examples/render_target_views.py,
 # and data/*.npz above does not reach a nested directory.
 data/**/*.npz
+
+data/*.pt

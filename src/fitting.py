@@ -103,3 +103,32 @@ def learning_rates(gaussians, scene_scale=1.0):
         {"params": [gaussians.logit_opacity], "lr": 5e-2},
         {"params": [gaussians.colors], "lr": 1e-2},
     ]
+
+
+def save_model(gaussians, path, meta=None):
+    """Persist a fitted model. Regenerable, so it is not tracked."""
+    import torch
+    payload = {name: getattr(gaussians, name).detach().clone()
+               for name in ("means", "log_scales", "quats", "logit_opacity", "colors")}
+    # Plain Python scalars only. A numpy float in here is enough to make the
+    # file unloadable under weights_only=True, which is the safe reader and
+    # the one load_model uses.
+    payload["meta"] = {k: (float(v) if isinstance(v, (int, float, np.floating))
+                           else str(v))
+                       for k, v in (meta or {}).items()}
+    torch.save(payload, path)
+
+
+def load_model(path, dtype=None, requires_grad=False):
+    """Load a fitted model. Everything downstream of step 3 reads this."""
+    import torch
+    from .splatting import Gaussians
+    payload = torch.load(path, weights_only=True)
+    fields = [payload[n] for n in ("means", "log_scales", "quats",
+                                   "logit_opacity", "colors")]
+    if dtype is not None:
+        fields = [f.to(dtype) for f in fields]
+    g = Gaussians(*fields)
+    if requires_grad:
+        g.requires_grad_(True)
+    return g
