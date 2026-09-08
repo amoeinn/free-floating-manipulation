@@ -39,12 +39,31 @@ def axis_angle_to_matrix(v: torch.Tensor) -> torch.Tensor:
 
 
 def matrix_to_axis_angle(R) -> np.ndarray:
+    """Rotation vector from a rotation matrix, including at 180 degrees.
+
+    The usual formula takes the axis from the antisymmetric part and divides
+    by `2 sin(angle)`. At exactly pi the rotation matrix is symmetric, that
+    part is zero, and the expression is 0/0: it silently returns the zero
+    vector, which is the identity. That is the worst possible failure here,
+    because a 180 degree flip about the panel axis is precisely what P1 and P2
+    are about, and the bug made the flipped pose evaluate as the true one and
+    report a loss ratio of exactly 1.00x.
+
+    Near pi the axis comes from `(R + I) / 2`, whose diagonal holds the
+    squared axis components, with the signs fixed from its largest row.
+    """
     R = np.asarray(R, float)
     angle = np.arccos(np.clip((np.trace(R) - 1) / 2, -1.0, 1.0))
     if angle < 1e-9:
         return np.zeros(3)
-    axis = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
-    return axis / (2 * np.sin(angle)) * angle
+    if angle < np.pi - 1e-6:
+        axis = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+        return axis / (2 * np.sin(angle)) * angle
+    M = (R + np.eye(3)) / 2.0
+    k = int(np.argmax(np.diag(M)))
+    axis = M[:, k] / np.sqrt(max(M[k, k], 1e-30))
+    axis = axis / np.linalg.norm(axis)
+    return axis * angle
 
 
 def quaternion_from_matrix(R: torch.Tensor) -> torch.Tensor:

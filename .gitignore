@@ -20,3 +20,4 @@ data/*.npz
 data/**/*.npz
 
 data/*.pt
+data/*.npz
