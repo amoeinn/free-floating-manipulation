@@ -186,9 +186,15 @@ def project(gaussians: Gaussians, camera: TorchCamera):
     return torch.stack([u, v], dim=-1), cov_2d, depth, mean_cam
 
 
+def _footprint(cov_2d, cutoff_sigmas):
+    """Half width and half height in pixels of a Gaussian's cutoff box."""
+    return cutoff_sigmas * torch.sqrt(torch.stack(
+        [cov_2d[:, 0, 0], cov_2d[:, 1, 1]], dim=-1).clamp_min(0.0))
+
+
 def render(gaussians: Gaussians, camera: TorchCamera, dilation: float = 0.0,
            background: float = 0.0, return_parts: bool = False,
-           sort_by_depth: bool = True):
+           sort_by_depth: bool = True, cutoff_sigmas: float = None):
     """The image, by projection, depth sort and front to back compositing.
 
     `sort_by_depth` exists so that the verification can turn the depth sort
@@ -227,6 +233,13 @@ def render(gaussians: Gaussians, camera: TorchCamera, dilation: float = 0.0,
     # exponent rather than the alpha keeps the gradient finite.
     valid = (depth > 1e-6) & (det > 1e-20)
     power = torch.where(valid[:, None, None], power, torch.full_like(power, -1e30))
+    if cutoff_sigmas is not None:
+        # The same truncation the tiled path gets for free by only visiting
+        # the tiles a Gaussian reaches. Applied here too, so that the two can
+        # be compared at machine precision rather than across a difference
+        # nobody has quantified.
+        power = torch.where(power > -0.5 * cutoff_sigmas ** 2, power,
+                            torch.full_like(power, -1e30))
     alpha = (opacity[:, None, None] * torch.exp(power)).clamp(0.0, 1.0 - 1e-7)
 
     transmittance = torch.cumprod(1.0 - alpha, dim=0)
@@ -239,3 +252,76 @@ def render(gaussians: Gaussians, camera: TorchCamera, dilation: float = 0.0,
                        "mu": mu, "cov": cov, "depth": depth,
                        "transmittance": transmittance}
     return image
+
+
+def render_tiled(gaussians: Gaussians, camera: TorchCamera, tile: int = 16,
+                 cutoff_sigmas: float = 3.0, dilation: float = 0.0,
+                 background: float = 0.0):
+    """The same image, visiting only the tiles each Gaussian actually reaches.
+
+    `render` evaluates every Gaussian at every pixel, which is `N x H x W`
+    and was measured at 2.9 s per forward and backward for 3000 Gaussians at
+    128 px. That is a property of the implementation and not of the method,
+    and letting it set the compute budget would report the wrong limit. This
+    does the identical arithmetic over a tile grid, so the cost falls to the
+    footprints the Gaussians occupy.
+
+    It is not a second method and must not be treated as one:
+    `verify_tiled_matches_dense` in `examples/fit_target.py` holds it to the
+    dense path at the same cutoff, which is the only thing that makes it safe
+    to fit with.
+    """
+    dtype, device = gaussians.means.dtype, gaussians.means.device
+    H, W = camera.height, camera.width
+    mu, cov, depth, _ = project(gaussians, camera)
+    if dilation:
+        cov = cov + dilation * torch.eye(2, dtype=dtype, device=device)
+
+    order = torch.argsort(depth)
+    mu, cov, depth = mu[order], cov[order], depth[order]
+    opacity = gaussians.opacity[order]
+    colors = gaussians.colors[order]
+
+    det = cov[:, 0, 0] * cov[:, 1, 1] - cov[:, 0, 1] * cov[:, 1, 0]
+    live = (depth > 1e-6) & (det > 1e-20)
+    inv = torch.stack([
+        torch.stack([cov[:, 1, 1], -cov[:, 0, 1]], -1),
+        torch.stack([-cov[:, 1, 0], cov[:, 0, 0]], -1),
+    ], dim=-2) / det.clamp_min(1e-20)[:, None, None]
+
+    half = _footprint(cov, cutoff_sigmas).detach()
+    lo = (mu.detach() - half)
+    hi = (mu.detach() + half)
+
+    n_x, n_y = (W + tile - 1) // tile, (H + tile - 1) // tile
+    tile_u = torch.arange(n_x, device=device) * tile
+    tile_v = torch.arange(n_y, device=device) * tile
+    # (n_y, n_x, N): does this Gaussian's cutoff box touch this tile?
+    overlap_u = (hi[:, 0][None, :] >= tile_u[:, None]) & (lo[:, 0][None, :] < tile_u[:, None] + tile)
+    overlap_v = (hi[:, 1][None, :] >= tile_v[:, None]) & (lo[:, 1][None, :] < tile_v[:, None] + tile)
+    touches = overlap_v[:, None, :] & overlap_u[None, :, :] & live[None, None, :]
+
+    uv_all = camera.pixel_grid(dtype, device)
+    rows = []
+    for iy in range(n_y):
+        row = []
+        for ix in range(n_x):
+            idx = torch.nonzero(touches[iy, ix], as_tuple=False).squeeze(-1)
+            patch = uv_all[iy * tile:(iy + 1) * tile, ix * tile:(ix + 1) * tile]
+            if idx.numel() == 0:
+                row.append(patch.new_full((*patch.shape[:2], 3), background))
+                continue
+            m, i2, op, col = mu[idx], inv[idx], opacity[idx], colors[idx]
+            d = patch[None] - m[:, None, None, :]
+            power = -0.5 * (d[..., 0] ** 2 * i2[:, None, None, 0, 0]
+                            + 2 * d[..., 0] * d[..., 1] * i2[:, None, None, 0, 1]
+                            + d[..., 1] ** 2 * i2[:, None, None, 1, 1])
+            power = torch.where(power > -0.5 * cutoff_sigmas ** 2, power,
+                                torch.full_like(power, -1e30))
+            a = (op[:, None, None] * torch.exp(power)).clamp(0.0, 1.0 - 1e-7)
+            T = torch.cumprod(1.0 - a, dim=0)
+            ahead = torch.cat([torch.ones_like(T[:1]), T[:-1]], dim=0)
+            img = ((a * ahead)[..., None] * col[:, None, None, :]).sum(0)
+            row.append(img + background * T[-1][..., None])
+        rows.append(torch.cat(row, dim=1))
+    return torch.cat(rows, dim=0)[:H, :W]
