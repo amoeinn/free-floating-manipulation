@@ -256,7 +256,7 @@ def render(gaussians: Gaussians, camera: TorchCamera, dilation: float = 0.0,
 
 def render_tiled(gaussians: Gaussians, camera: TorchCamera, tile: int = 16,
                  cutoff_sigmas: float = 3.0, dilation: float = 0.0,
-                 background: float = 0.0):
+                 background: float = 0.0, return_coverage: bool = False):
     """The same image, visiting only the tiles each Gaussian actually reaches.
 
     `render` evaluates every Gaussian at every pixel, which is `N x H x W`
@@ -302,14 +302,15 @@ def render_tiled(gaussians: Gaussians, camera: TorchCamera, tile: int = 16,
     touches = overlap_v[:, None, :] & overlap_u[None, :, :] & live[None, None, :]
 
     uv_all = camera.pixel_grid(dtype, device)
-    rows = []
+    rows, cover_rows = [], []
     for iy in range(n_y):
-        row = []
+        row, cover_row = [], []
         for ix in range(n_x):
             idx = torch.nonzero(touches[iy, ix], as_tuple=False).squeeze(-1)
             patch = uv_all[iy * tile:(iy + 1) * tile, ix * tile:(ix + 1) * tile]
             if idx.numel() == 0:
                 row.append(patch.new_full((*patch.shape[:2], 3), background))
+                cover_row.append(patch.new_zeros(patch.shape[:2]))
                 continue
             m, i2, op, col = mu[idx], inv[idx], opacity[idx], colors[idx]
             d = patch[None] - m[:, None, None, :]
@@ -323,5 +324,13 @@ def render_tiled(gaussians: Gaussians, camera: TorchCamera, tile: int = 16,
             ahead = torch.cat([torch.ones_like(T[:1]), T[:-1]], dim=0)
             img = ((a * ahead)[..., None] * col[:, None, None, :]).sum(0)
             row.append(img + background * T[-1][..., None])
+            # Accumulated coverage, which is opacity and not brightness. A
+            # face turned away from the light is black and fully covered, so
+            # thresholding the image would call it empty.
+            cover_row.append(1.0 - T[-1])
         rows.append(torch.cat(row, dim=1))
-    return torch.cat(rows, dim=0)[:H, :W]
+        cover_rows.append(torch.cat(cover_row, dim=1))
+    image = torch.cat(rows, dim=0)[:H, :W]
+    if return_coverage:
+        return image, torch.cat(cover_rows, dim=0)[:H, :W]
+    return image
