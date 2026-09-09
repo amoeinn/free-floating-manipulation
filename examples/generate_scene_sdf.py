@@ -33,6 +33,13 @@ ROOT = Path(__file__).resolve().parent.parent
 MODELS = ROOT / "ws" / "src" / "free_floating_manipulation" / "models"
 OUT = MODELS / "servicing_scene.sdf"
 MANIFEST = MODELS / "servicing_scene.json"
+# colcon installs models/ into the share directory, and the launch file loads
+# the installed copy rather than this one. Regenerating the source without
+# rebuilding therefore leaves the launch path running a stale world, which is
+# the same two-descriptions-that-drift problem this generator exists to
+# prevent, one directory further along. --check covers it.
+INSTALLED = (ROOT / "ws" / "install" / "free_floating_manipulation" / "share"
+             / "free_floating_manipulation" / "models" / "servicing_scene.sdf")
 PANDA_URDF = ROOT / "ws" / "build" / "panda_identified.urdf"
 
 # The servicer's own body, the same box the phase 3 demonstration used, so the
@@ -213,7 +220,16 @@ def main():
                 f"{OUT.name} is stale: it does not match what src/target.py and the "
                 "Panda URDF now produce.\nRegenerate it with "
                 "`python examples/generate_scene_sdf.py`.")
-        print(f"{OUT.name} is current: {len(arm_names)} arm bodies, "
+        if INSTALLED.exists() and INSTALLED.read_text() != sdf:
+            raise SystemExit(
+                "the installed world is stale. The launch file loads\n"
+                f"  {INSTALLED}\n"
+                "and not the copy under ws/src, so a regenerated source that has "
+                "not been rebuilt\nleaves the scene running an old world. Rebuild "
+                "with:\n  colcon build --base-paths ws --build-base ws/build "
+                "--install-base ws/install")
+        where = "source and installed copies" if INSTALLED.exists() else "source copy"
+        print(f"{OUT.name} is current in the {where}: {len(arm_names)} arm bodies, "
               f"{len(client_names)} client bodies")
         return
 

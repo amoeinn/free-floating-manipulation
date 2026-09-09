@@ -183,6 +183,34 @@ class ScenePublisher(RosNode):
         self.assert_scene_matches()
         return node
 
+    def _pose_info(self, attempts=20, gap=0.5):
+        """One sample of the world's pose topic, waiting for the server.
+
+        Under `ros2 launch` the server and this node start together, so the
+        first query can easily arrive before the world has loaded. Retrying
+        for a bounded time is the difference between a scene that comes up and
+        an intermittent failure that phase 6 would inherit and have to debug
+        alongside its own new code.
+        """
+        import subprocess
+        import time
+        for attempt in range(attempts):
+            try:
+                out = subprocess.run(
+                    ["gz", "topic", "-e", "-t", f"/world/{WORLD}/pose/info", "-n", "1"],
+                    capture_output=True, text=True, timeout=4).stdout
+            except subprocess.TimeoutExpired:
+                out = ""
+            if "name:" in out:
+                if attempt:
+                    self.get_logger().info(
+                        f"world '{WORLD}' answered after {attempt + 1} attempts")
+                return out
+            time.sleep(gap)
+        raise SystemExit(
+            f"no pose traffic on world '{WORLD}' after {attempts * gap:.0f} s. "
+            "Is the Gazebo server up, and is it running this world?")
+
     def assert_scene_matches(self):
         """Every model this node will drive exists in the running world.
 
@@ -192,13 +220,7 @@ class ScenePublisher(RosNode):
         nothing reports an error.
         """
         import re
-        import subprocess
-        try:
-            out = subprocess.run(
-                ["gz", "topic", "-e", "-t", f"/world/{WORLD}/pose/info", "-n", "1"],
-                capture_output=True, text=True, timeout=8).stdout
-        except subprocess.TimeoutExpired:
-            raise SystemExit(f"no pose traffic on world '{WORLD}'; is the server up?")
+        out = self._pose_info()
         present = set(re.findall(r'name:\s*"([^"]+)"', out))
         wanted = set(self.manifest["arm"]) | set(self.manifest["client"]) | {
             self.manifest["bus"]}
@@ -207,7 +229,9 @@ class ScenePublisher(RosNode):
             raise SystemExit(
                 f"the running world does not contain {absent}. Every one of these "
                 "would be sent in the same batch, and one unknown name voids the "
-                "batch while the service still reports success.")
+                "batch while the service still reports success. If the names look "
+                "right, the installed world may be stale: run "
+                "`python examples/generate_scene_sdf.py --check`.")
         self.get_logger().info(
             f"scene check: all {len(wanted)} models this node drives exist in "
             f"world '{WORLD}'")
@@ -223,13 +247,14 @@ class ScenePublisher(RosNode):
         result would still look like a plausible scene.
         """
         import subprocess
+        self._pose_info()          # wait for the world before asking about it
         try:
             out = subprocess.run(
-                ["gz", "topic", "-e", "-t", f"/world/{WORLD}/dynamic_pose/info", "-n", "1"],
-                capture_output=True, text=True, timeout=4).stdout
+                ["gz", "topic", "-e", "-t", f"/world/{WORLD}/dynamic_pose/info",
+                 "-n", "1"], capture_output=True, text=True, timeout=4).stdout
         except subprocess.TimeoutExpired:
             out = ""
-        moving = [ln for ln in out.splitlines() if "name:" in ln]
+        moving = [ln.strip() for ln in out.splitlines() if "name:" in ln]
         if moving:
             raise SystemExit(
                 "Gazebo is integrating " + ", ".join(moving) + ". Every model in "
