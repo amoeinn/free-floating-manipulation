@@ -1,0 +1,24 @@
+{
+  "world": "servicing",
+  "arm": [
+    "panda_link0",
+    "panda_link1",
+    "panda_link2",
+    "panda_link3",
+    "panda_link4",
+    "panda_link5",
+    "panda_link6",
+    "panda_link7",
+    "panda_hand",
+    "panda_leftfinger",
+    "panda_rightfinger"
+  ],
+  "client": [
+    "client_bus",
+    "client_panel_plus_y",
+    "client_panel_minus_y",
+    "client_dish",
+    "client_boom"
+  ],
+  "bus": "servicer_bus"
+}

@@ -60,6 +60,12 @@ ament_target_dependencies(servicing_demo moveit_core moveit_ros_planning rclcpp
 
 install(TARGETS dump_dynamics servicing_demo DESTINATION lib/${PROJECT_NAME})
 
+# Phase 5: the Gazebo scene. The SDF is generated from src/target.py and the
+# Panda URDF by examples/generate_scene_sdf.py, never edited by hand; run that
+# generator with --check to confirm the committed copy is current.
+install(PROGRAMS scripts/scene_publisher.py DESTINATION lib/${PROJECT_NAME})
+install(DIRECTORY models launch DESTINATION share/${PROJECT_NAME})
+
 ament_export_include_directories(include)
 ament_export_libraries(free_floating_dynamics)
 ament_export_dependencies(moveit_core urdf srdfdom Eigen3)
