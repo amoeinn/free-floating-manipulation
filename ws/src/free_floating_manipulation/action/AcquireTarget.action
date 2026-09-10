@@ -1,0 +1,18 @@
+# Acquire the client's pose from imagery, with no prior.
+#
+# Restarts are drawn uniformly over SO(3) and the lowest final loss wins.
+# Measured in phase 4: 22 percent of single attempts land in the true basin,
+# and best of 8 reaches 87 percent. This takes about 106 s at 8 restarts on
+# CPU, which is why it is an action and not a service.
+int32 restarts
+int32 iterations
+bool inject_flip            # test hook: return the 180 degree flip of whatever was found
+---
+bool acquired
+geometry_msgs/PoseStamped pose
+float64 final_loss
+int32 restarts_used
+string reason
+---
+int32 restarts_done
+float64 best_loss

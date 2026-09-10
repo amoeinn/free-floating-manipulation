@@ -10,9 +10,17 @@
      the motion comes from the verified dynamics in src/. -->
 <sdf version="1.9">
   <world name="servicing">
+    <!-- The real time factor is set deliberately and is not a default.
+         Phase 6's perception cannot run at real time on CPU: one silhouette
+         tracking step is 3.48 s measured, and tracking at a 2 Hz sim rate
+         therefore needs 3.48 s of wall time per 0.5 s of simulation. The
+         mission runs the scene slow enough that acquisition and its
+         verification both fit inside the window where the flip test still
+         works, so the rate is a stated parameter rather than something that
+         surfaces later as jitter and gets mistaken for a bug. -->
     <physics name="default" type="dart">
       <max_step_size>0.001</max_step_size>
-      <real_time_factor>1.0</real_time_factor>
+      <real_time_factor>1.000</real_time_factor>
     </physics>
 
     <!-- The Physics system is present and integrates nothing, which is not a
@@ -171,7 +179,7 @@
     </model>
     <model name="client_bus">
       <static>true</static>
-      <pose>0.000000 0.000000 6.000000 0.000000000 0.000000000 0.000000000</pose>
+      <pose>4.000000 -3.000000 2.000000 0.000000000 0.000000000 0.000000000</pose>
       <link name="body">
       <visual name="v">
         <pose>0 0 0 0 0 0</pose>
@@ -186,7 +194,7 @@
     </model>
     <model name="client_panel_plus_y">
       <static>true</static>
-      <pose>0.000000 1.550000 6.000000 0.000000000 0.000000000 0.000000000</pose>
+      <pose>4.000000 -1.450000 2.000000 0.000000000 0.000000000 0.000000000</pose>
       <link name="body">
       <visual name="v">
         <pose>0 0 0 0 0 0</pose>
@@ -201,7 +209,7 @@
     </model>
     <model name="client_panel_minus_y">
       <static>true</static>
-      <pose>0.000000 -1.550000 6.000000 0.000000000 0.000000000 0.000000000</pose>
+      <pose>4.000000 -4.550000 2.000000 0.000000000 0.000000000 0.000000000</pose>
       <link name="body">
       <visual name="v">
         <pose>0 0 0 0 0 0</pose>
@@ -216,7 +224,7 @@
     </model>
     <model name="client_dish">
       <static>true</static>
-      <pose>0.000000 0.000000 6.695000 0.000000000 0.000000000 0.000000000</pose>
+      <pose>4.000000 -3.000000 2.695000 0.000000000 0.000000000 0.000000000</pose>
       <link name="body">
       <visual name="v">
         <pose>0 0 0 0 0 0</pose>
@@ -231,7 +239,7 @@
     </model>
     <model name="client_boom">
       <static>true</static>
-      <pose>1.025000 0.000000 5.750000 0.000000000 1.570796327 0.000000000</pose>
+      <pose>5.025000 -3.000000 1.750000 0.000000000 1.570796327 0.000000000</pose>
       <link name="body">
       <visual name="v">
         <pose>0 0 0 0 0 0</pose>

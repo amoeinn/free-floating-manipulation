@@ -58,6 +58,34 @@ target_link_libraries(servicing_demo ${OMPL_LIBRARIES})
 ament_target_dependencies(servicing_demo moveit_core moveit_ros_planning rclcpp
   pluginlib urdf srdfdom geometry_msgs moveit_msgs)
 
+# Phase 6 interfaces. The executive is C++ and perception is Python, so the
+# seam between them is a ROS 2 action and a service rather than a function
+# call. Acquisition takes about 106 s, which is why it is an action.
+find_package(rosidl_default_generators REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(trajectory_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "srv/VerifyFlip.srv"
+  "action/AcquireTarget.action"
+  DEPENDENCIES geometry_msgs)
+
+find_package(behaviortree_cpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
+find_package(std_msgs REQUIRED)
+add_executable(mission_executive src/mission_executive.cpp)
+# trajectory_validity.cpp is already inside free_floating_dynamics.
+target_link_libraries(mission_executive free_floating_dynamics
+  behaviortree_cpp::behaviortree_cpp ${OMPL_LIBRARIES})
+target_include_directories(mission_executive PRIVATE ${OMPL_INCLUDE_DIRS})
+ament_target_dependencies(mission_executive moveit_core moveit_ros_planning rclcpp
+  rclcpp_action pluginlib urdf srdfdom geometry_msgs moveit_msgs trajectory_msgs
+  std_msgs)
+rosidl_target_interfaces(mission_executive ${PROJECT_NAME} "rosidl_typesupport_cpp")
+
+install(PROGRAMS scripts/perception_node.py scripts/mission_audit.py
+  DESTINATION lib/${PROJECT_NAME})
+install(TARGETS mission_executive DESTINATION lib/${PROJECT_NAME})
 install(TARGETS dump_dynamics servicing_demo DESTINATION lib/${PROJECT_NAME})
 
 # Phase 5: the Gazebo scene. The SDF is generated from src/target.py and the

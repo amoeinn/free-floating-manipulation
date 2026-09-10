@@ -79,7 +79,7 @@ def main():
 
     print("\n  the sun angle is the rotation angle, because the body turns under a "
           "fixed sun")
-    print("  recorded in PLAN.md as the cost of not making the model relightable")
+    print("  this is the cost of not making the model relightable")
 
 
 if __name__ == "__main__":

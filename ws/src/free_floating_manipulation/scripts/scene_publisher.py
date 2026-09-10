@@ -64,14 +64,41 @@ if np.__version__ != EXPECTED_NUMPY:
 import rclpy
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node as RosNode
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import Image, JointState
+from trajectory_msgs.msg import JointTrajectory
 
 from src import freeflight
+from src.raytrace import Camera, Scene, look_at
+from src.target import client_satellite, client_scene
 from src.freeflight import JointLoop, rotation_exponential
 from src.tumble import angular_momentum, assert_triaxial, integrate, kinetic_energy
 
 WORLD = "servicing"
-CLIENT_START = np.array([0.0, 0.0, 6.0])
+CAMERA_RES = 128
+CAMERA_FOV_DEG = 40.0
+CAMERA_HZ = 2.0            # in simulated time; see TIME_SCALE
+
+# Simulated seconds per wall second. This belongs here and not in the world
+# file, which was the first mistake: Gazebo's real_time_factor governs Gazebo's
+# own stepping, and Gazebo integrates nothing in this scene. The dynamics are
+# this node's, so the timebase is this node's, and setting the factor in the
+# SDF changed nothing at all. Measured: with the world pinned at 0.02 the
+# client still tumbled at wall rate and the mission's flip test refused at a
+# body frame sun angle of 81.7 degrees.
+#
+# The value is set by acquisition rather than by tracking. Acquisition takes
+# about 106 s of wall time at eight restarts and the flip test after it is
+# only valid while the body frame sun has moved under about 15 degrees, which
+# at 2.7 deg/s is 5.5 s of simulated time. 0.02 spends about 5.7 degrees
+# acquiring and leaves the window open.
+TIME_SCALE = 0.02
+# Where the client sits relative to the servicer. Not arbitrary: the splat
+# model carries the lighting it was fitted under, so the servicer has to view
+# an aspect the sun actually lights. Measured over six placements, this one
+# lights 23.5 percent of the frame against the model's 40.3 and gives the
+# smallest image difference at 0.0117; directly overhead lights 4.4 percent
+# and acquisition has almost nothing to lock onto.
+CLIENT_START = np.array([4.0, -3.0, 2.0])
 CLIENT_INERTIA = np.array([1.0, 1.9, 2.6])
 CLIENT_RATE_DEG_S = 2.7
 CLIENT_OMEGA_DIR = np.array([0.35, 0.22, 0.16])
@@ -164,14 +191,40 @@ class ScenePublisher(RosNode):
         self.base_t = np.zeros(3)
         self.k = 0
 
-        self.pub_target = self.create_publisher(PoseStamped, "/target/pose", 10)
+        # The client's true pose is ground truth and lives under /truth. The
+        # executive must never subscribe to it: if it could, the mission would
+        # succeed by reading the answer and the audit would mean nothing. The
+        # servicer's own base pose and joint states stay where they are,
+        # because a real servicer knows both from its own sensors.
+        self.pub_target = self.create_publisher(PoseStamped, "/truth/target/pose", 10)
         self.pub_base = self.create_publisher(PoseStamped, "/servicer/base_pose", 10)
         self.pub_joints = self.create_publisher(JointState, "/servicer/joint_states", 10)
+        self.pub_image = self.create_publisher(Image, "/servicer/camera/image", 2)
+        self.pub_mask = self.create_publisher(Image, "/servicer/camera/mask", 2)
+        self.sub_command = self.create_subscription(
+            JointTrajectory, "/servicer/joint_command", self.on_command, 10)
+
+        # The arm holds its commanded pose and does nothing on its own. A
+        # scene that runs a fixed loop regardless would move the base under
+        # the camera during acquisition, which is not a mission that anybody
+        # would fly.
+        self.command = None
+        self.command_start = None
+        self.hold = self.loop.angles(0.0)
+        self.scene_geometry = client_scene()
+        self.camera_period = 1.0 / CAMERA_HZ
+        self.next_camera = 0.0
 
         self.gz = None
         if self.get_parameter("gazebo").value:
             self.gz = self._connect_gazebo()
-        self.timer = self.create_timer(self.dt, self.step)
+        # dt is simulated; the timer is wall. Ticking slower is what makes
+        # simulated time pass slower, because nothing else here is driving it.
+        self.timer = self.create_timer(self.dt / TIME_SCALE, self.step)
+        self.get_logger().info(
+            f"time scale {TIME_SCALE}: {self.dt:.3f} s of simulation per "
+            f"{self.dt / TIME_SCALE:.2f} s of wall clock, so acquisition's "
+            f"106 s costs about {106 * TIME_SCALE * 2.7:.1f} deg of tumble")
 
     def _connect_gazebo(self):
         from gz.msgs10.boolean_pb2 import Boolean
@@ -264,16 +317,90 @@ class ScenePublisher(RosNode):
             "physics check: dynamic_pose/info carries no bodies, so Gazebo is "
             "integrating nothing and every pose below is ours")
 
-    def arm_state(self, t):
-        """The loop's angles and rates at time `t`.
+    def on_command(self, msg):
+        """Take a joint trajectory from the executive and start executing it."""
+        if not msg.points:
+            return
+        self.command = msg
+        self.command_start = self.k * self.dt
+        self.get_logger().info(
+            f"joint command accepted: {len(msg.points)} points over "
+            f"{msg.points[-1].time_from_start.sec}."
+            f"{msg.points[-1].time_from_start.nanosec // 10**8} s")
 
-        `JointLoop` is parameterised by phase rather than by time, and takes
-        the phase rate separately so the rates stay consistent with the
-        angles under any time scaling. Both come back as full seven vectors.
+    def render_camera(self, client_R, stamp):
+        """A ray traced view of the client from the servicer.
+
+        The phase 4 splat model was fitted on this renderer under one hard
+        light with no fill, so this is the imagery it can actually be tracked
+        against. Rendering the same scene through Gazebo instead is the
+        sim-to-sim test named as an extension in the project notes, and it is a
+        different and open ended question.
         """
-        phase = 2.0 * np.pi * t / self.loop.period
-        phase_rate = 2.0 * np.pi / self.loop.period
-        return self.loop.angles(phase), self.loop.rates(phase, phase_rate)
+        eye = self.base_t + self.base_R @ np.array([0.0, 0.0, 0.25])
+        target = np.asarray(CLIENT_START, float)
+        R_cw, t_cw = look_at(eye, target, np.array([0.0, 0.0, 1.0]))
+        cam = Camera.with_fov(CAMERA_RES, CAMERA_RES, CAMERA_FOV_DEG, R_cw, t_cw)
+
+        prims = []
+        for prim in client_satellite():
+            moved = type(prim).__new__(type(prim))
+            moved.__dict__.update(prim.__dict__)
+            moved.position = CLIENT_START + client_R @ np.asarray(prim.position, float)
+            moved._R = client_R @ prim._R
+            prims.append(moved)
+        scene = Scene(primitives=prims,
+                      light_direction=self.scene_geometry.light_direction,
+                      light_intensity=self.scene_geometry.light_intensity)
+        out = scene.render(cam)
+
+        img = Image()
+        img.header.stamp = stamp
+        img.header.frame_id = "servicer_camera"
+        img.height = img.width = CAMERA_RES
+        img.encoding = "rgb8"
+        img.step = 3 * CAMERA_RES
+        img.data = (np.clip(out["image"], 0.0, 1.0) * 255).astype(np.uint8).tobytes()
+        self.pub_image.publish(img)
+
+        mask = Image()
+        mask.header = img.header
+        mask.height = mask.width = CAMERA_RES
+        mask.encoding = "mono8"
+        mask.step = CAMERA_RES
+        mask.data = (out["hit"].astype(np.uint8) * 255).tobytes()
+        self.pub_mask.publish(mask)
+
+    def arm_state(self, t):
+        """The commanded joint angles and rates at time `t`.
+
+        With no command the arm holds, which matters: joint motion is what
+        moves the base, so an arm that runs a loop on its own would swing the
+        camera around during acquisition.
+        """
+        if self.command is None:
+            return self.hold, np.zeros(len(self.hold))
+        points = self.command.points
+        elapsed = t - self.command_start
+        span = (points[-1].time_from_start.sec
+                + points[-1].time_from_start.nanosec * 1e-9)
+        if span <= 0 or elapsed >= span:
+            self.hold = np.asarray(points[-1].positions, float)
+            self.command = None
+            return self.hold, np.zeros(len(self.hold))
+        # Linear in time between the two bracketing points, with the rate
+        # taken from the same segment so angles and rates stay consistent.
+        times = [p.time_from_start.sec + p.time_from_start.nanosec * 1e-9
+                 for p in points]
+        j = int(np.searchsorted(times, elapsed))
+        j = max(1, min(j, len(points) - 1))
+        t0, t1 = times[j - 1], times[j]
+        a0 = np.asarray(points[j - 1].positions, float)
+        a1 = np.asarray(points[j].positions, float)
+        dt = max(t1 - t0, 1e-9)
+        frac = (elapsed - t0) / dt
+        self.hold = a0 + frac * (a1 - a0)
+        return self.hold, (a1 - a0) / dt
 
     def step(self):
         import torch
@@ -305,6 +432,11 @@ class ScenePublisher(RosNode):
 
         if self.gz is not None:
             self._drive_gazebo(client_R)
+        # Every tick. A render is about 90 ms against a tick of
+        # dt / TIME_SCALE seconds of wall clock, so it is free, and pacing it
+        # in simulated time instead made frames arrive 25 s apart and the
+        # mission aborted on "no imagery yet" before the first one landed.
+        self.render_camera(client_R, stamp)
         self.k += 1
 
     def _publish_pose(self, pub, stamp, R, t):

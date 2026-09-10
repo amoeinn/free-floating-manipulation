@@ -10,7 +10,6 @@
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <!-- The behavior tree that sequences the mission. -->
-  <depend>behaviortree_cpp</depend>
 
   <!-- MoveIt 2, open source and installable from the public ROS 2 apt
        repository, which is why phase 3 targets it rather than MoveIt Pro. -->
@@ -20,7 +19,6 @@
   <depend>moveit_msgs</depend>
 
   <depend>rclcpp</depend>
-  <depend>geometry_msgs</depend>
   <depend>pluginlib</depend>
   <depend>urdf</depend>
   <depend>srdfdom</depend>
@@ -31,6 +29,11 @@
   <exec_depend>moveit_resources_panda_description</exec_depend>
   <exec_depend>moveit_resources_panda_moveit_config</exec_depend>
 
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <depend>trajectory_msgs</depend>
+  <depend>rclcpp_action</depend>
+  <member_of_group>rosidl_interface_packages</member_of_group>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>ros_gz_sim</exec_depend>

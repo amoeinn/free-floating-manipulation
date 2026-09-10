@@ -47,7 +47,13 @@ PANDA_URDF = ROOT / "ws" / "build" / "panda_identified.urdf"
 BUS_HALF = np.array([0.30, 0.30, 0.18])
 BUS_CENTRE = np.array([0.0, 0.0, -0.32])
 BUS_ALBEDO = np.array([0.55, 0.55, 0.58])
-CLIENT_START = np.array([0.0, 0.0, 6.0])
+# Where the client sits relative to the servicer. Not arbitrary: the splat
+# model carries the lighting it was fitted under, so the servicer has to view
+# an aspect the sun actually lights. Measured over six placements, this one
+# lights 23.5 percent of the frame against the model's 40.3 and gives the
+# smallest image difference at 0.0117; directly overhead lights 4.4 percent
+# and acquisition has almost nothing to lock onto.
+CLIENT_START = np.array([4.0, -3.0, 2.0])
 
 
 def rgba(albedo, alpha=1.0):
@@ -134,6 +140,21 @@ def panda_models():
     return models, names
 
 
+# Gazebo runs at real time and this number is close to meaningless here, which
+# is worth saying rather than leaving as a value someone might tune. Gazebo
+# integrates nothing in this scene: every model is static and every pose is
+# commanded. The rate that matters is TIME_SCALE in scene_publisher.py, which
+# is where the dynamics actually are. Sized by acquisition, not by tracking.
+# Tracking needs 3.48 s of wall time per 0.5 s of simulation, giving 0.14. But
+# acquisition takes 106 s of wall time at eight restarts, and the flip test
+# that follows it is only valid while the body frame sun has moved under about
+# 15 degrees. At 2.7 deg/s that is 5.5 s of simulation, so 0.14 spends 40
+# degrees of tumble acquiring and the verification then correctly refuses to
+# answer. Measured: the first mission run reported a sun angle of 84.2 deg and
+# aborted. The whole mission has to fit inside the window, not just one step.
+REAL_TIME_FACTOR = 1.0
+
+
 def build():
     sun = client_scene().light_direction
     models = [static_model("servicer_bus",
@@ -157,13 +178,22 @@ def build():
               "     physics engine integrates none of this, which is the point:\n"
               "     the motion comes from the verified dynamics in src/. -->")
 
+    rtf = REAL_TIME_FACTOR
     return f"""<?xml version="1.0" ?>
 {header}
 <sdf version="1.9">
   <world name="servicing">
+    <!-- The real time factor is set deliberately and is not a default.
+         Phase 6's perception cannot run at real time on CPU: one silhouette
+         tracking step is 3.48 s measured, and tracking at a 2 Hz sim rate
+         therefore needs 3.48 s of wall time per 0.5 s of simulation. The
+         mission runs the scene slow enough that acquisition and its
+         verification both fit inside the window where the flip test still
+         works, so the rate is a stated parameter rather than something that
+         surfaces later as jitter and gets mistaken for a bug. -->
     <physics name="default" type="dart">
       <max_step_size>0.001</max_step_size>
-      <real_time_factor>1.0</real_time_factor>
+      <real_time_factor>{rtf:.3f}</real_time_factor>
     </physics>
 
     <!-- The Physics system is present and integrates nothing, which is not a
@@ -248,6 +278,7 @@ def main():
     print(f"  {len(arm_names)} arm bodies: {', '.join(arm_names[:4])} ...")
     print(f"  {len(client_names)} client bodies: {', '.join(client_names)}")
     print(f"  every one static, so Gazebo integrates none of it")
+    print(f"  real time factor pinned at {REAL_TIME_FACTOR}, for the tracker to keep up")
 
 
 if __name__ == "__main__":

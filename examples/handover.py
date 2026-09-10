@@ -30,9 +30,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.fitting import load_model
 from src.splatting import TorchCamera
+from src.acquisition import (TRACK_ITERATIONS as TRACK_ITERS, acquire_pose,
+                             flip_matrix, flip_test, track_step)
 from src.tracking import (axis_angle_to_matrix, matrix_to_axis_angle,
                           photometric_loss, register, silhouette_loss)
-from src.tumble import skew
 
 ROOT = Path(__file__).resolve().parent.parent
 DT = torch.float32
@@ -65,22 +66,6 @@ def geodesic(Ra, Rb):
     return np.degrees(np.arccos(np.clip((np.trace(Ra.T @ Rb) - 1) / 2, -1.0, 1.0)))
 
 
-def flip_matrix():
-    K = skew(PANEL_AXIS)
-    return np.eye(3) + 2 * K @ K
-
-
-def uniform_so3(n, rng):
-    q = rng.normal(size=(n, 4))
-    q /= np.linalg.norm(q, axis=1, keepdims=True)
-    w, x, y, z = q.T
-    return np.stack([
-        np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)], -1),
-        np.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)], -1),
-        np.stack([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1),
-    ], axis=-2)
-
-
 def classify(R, truth):
     if geodesic(R, truth) < BASIN_DEG:
         return "correct"
@@ -107,30 +92,18 @@ def acquire():
 
     rows = []
     for trial in range(TRIALS):
-        best_loss, best_rot = np.inf, None
-        for R0 in uniform_so3(RESTARTS, rng):
-            rot, tr, trace = register(model, camera, image, matrix_to_axis_angle(R0),
-                                      np.zeros(3), photometric_loss,
-                                      iterations=ACQ_ITERATIONS, lr_rot=0.08,
-                                      lr_trans=0.02, centre=ORIGIN)
-            if trace[-1] < best_loss:
-                best_loss, best_rot = trace[-1], rot.numpy()
-
-        R_acq = axis_angle_to_matrix(
-            torch.as_tensor(best_rot, dtype=torch.float64)).numpy()
+        R_acq, best_loss, _ = acquire_pose(
+            model, camera, image, restarts=RESTARTS,
+            iterations=ACQ_ITERATIONS, rng=rng)
         before = classify(R_acq, truth)
 
         # One extra render: is the flipped pose a better explanation?
-        R_alt = R_acq @ flip_matrix()
-        rot_alt = matrix_to_axis_angle(R_alt)
-        with torch.no_grad():
-            loss_alt = photometric_loss(model, torch.as_tensor(rot_alt, dtype=DT),
-                                        ORIGIN, camera, image, ORIGIN).item()
-        ratio = loss_alt / max(best_loss, 1e-12)
-        if ratio < 1.0:
-            best_rot, R_acq = rot_alt, R_alt
+        repair, ratio = flip_test(model, camera, image, R_acq)
+        if repair:
+            R_alt = R_acq @ flip_matrix()
+            R_acq = R_alt
         after = classify(R_acq, truth)
-        rows.append((best_rot, before, after, best_loss, ratio))
+        rows.append((matrix_to_axis_angle(R_acq), before, after, best_loss, ratio))
         print(f"  {trial:5d} {before:>8} {geodesic(R_acq, truth):8.2f}d "
               f"{best_loss:11.4e} {ratio:10.2f}x {after:>11} "
               f"{geodesic(R_acq, truth):8.2f}d")
@@ -189,16 +162,14 @@ def track():
           f"{'past 20 deg':>12}")
 
     for label, rot0 in picks:
-        rot, tr = np.asarray(rot0, float), np.zeros(3)
+        R = None
         errors = []
         for k in range(len(truth)):
             if k > 0:
-                rot_t, tr_t, _ = register(model, camera, masks[k], rot, tr,
-                                          silhouette_loss,
-                                          iterations=TRACK_ITERATIONS,
-                                          lr_rot=0.02, lr_trans=0.010, centre=ORIGIN)
-                rot, tr = rot_t.numpy(), tr_t.numpy()
-            R = axis_angle_to_matrix(torch.as_tensor(rot, dtype=torch.float64)).numpy()
+                R = track_step(model, camera, masks[k], R)
+            else:
+                R = axis_angle_to_matrix(
+                    torch.as_tensor(rot0, dtype=torch.float64)).numpy()
             errors.append(geodesic(R, truth[k]))
         e = np.array(errors)
         print(f"  {label:<24} {e.max():8.2f}d {e[-1]:8.2f}d {np.median(e):8.2f}d "
@@ -242,14 +213,7 @@ def detect():
     for k in (0, 24, 48, 72, 96):
         for label, R in (("correct", truth[k]),
                          ("flipped", truth[k] @ flip_matrix())):
-            with torch.no_grad():
-                a = photometric_loss(model, torch.as_tensor(
-                    matrix_to_axis_angle(R), dtype=DT), ORIGIN, camera,
-                    images[k], ORIGIN).item()
-                b = photometric_loss(model, torch.as_tensor(
-                    matrix_to_axis_angle(R @ flip_matrix()), dtype=DT), ORIGIN,
-                    camera, images[k], ORIGIN).item()
-            r = b / max(a, 1e-12)
+            _, r = flip_test(model, camera, images[k], R)
             print(f"  {k:5d} {float(d['sun_angle_deg'][k]):5.1f} {label:>12} "
                   f"{r:7.2f}x {'keep' if r >= 1 else 'REPAIR':>9}")
     print("\n  the test is decisive at acquisition, 3.84x against 0.26x with the "

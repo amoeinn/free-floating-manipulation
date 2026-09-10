@@ -1,6 +1,6 @@
 """3D Gaussian splatting forward pass, in torch, differentiable end to end.
 
-Written rather than imported. `PLAN.md` records why: every usable
+Written rather than imported, and the reason is not only licensing: every usable
 implementation is either copyleft, non-commercial, or CUDA only, and beyond
 the licences a dependency would remove the content of the phase and leave
 nothing to disagree with.

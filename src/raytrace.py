@@ -58,7 +58,18 @@ def look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> tuple[np.nda
     """
     eye = np.asarray(eye, float)
     forward = normalize(np.asarray(target, float) - eye)
-    right = normalize(np.cross(forward, np.asarray(up, float)))
+    axis = np.cross(forward, np.asarray(up, float))
+    # A view direction parallel to `up` leaves no way to orient the image, and
+    # the arithmetic does not complain: `right` comes out as the zero vector,
+    # the rotation matrix is singular, every ray is degenerate and the render
+    # is uniformly black. That looks like an empty scene rather than a broken
+    # camera, so it is refused here instead.
+    if np.linalg.norm(axis) < 1e-9:
+        raise ValueError(
+            f"look_at: the up vector {np.asarray(up, float)} is parallel to the "
+            f"view direction {np.round(forward, 6)}, so the camera roll is "
+            "undefined. Pick an up vector that is not along the line of sight.")
+    right = normalize(axis)
     down = np.cross(forward, right)
     R = np.stack([right, down, forward])          # rows are the camera axes in world
     return R, -R @ eye
