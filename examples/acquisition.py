@@ -28,9 +28,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.fitting import load_model
 from src.splatting import TorchCamera
+from src.acquisition import (ACQUIRE_LR_ROT, ACQUIRE_LR_TRANS, flip_matrix,
+                             register_from, uniform_so3)
 from src.tracking import (axis_angle_to_matrix, matrix_to_axis_angle,
                           photometric_loss, register, silhouette_loss)
-from src.tumble import skew
 
 ROOT = Path(__file__).resolve().parent.parent
 DT = torch.float32
@@ -57,21 +58,7 @@ def geodesic(Ra, Rb):
 
 
 def flipped(R):
-    K = skew(PANEL_AXIS)
-    return R @ (np.eye(3) + 2 * K @ K)
-
-
-def uniform_so3(n, rng):
-    """Uniform rotations, by normalised Gaussian quaternions."""
-    q = rng.normal(size=(n, 4))
-    q /= np.linalg.norm(q, axis=1, keepdims=True)
-    w, x, y, z = q.T
-    R = np.stack([
-        np.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)], -1),
-        np.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)], -1),
-        np.stack([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1),
-    ], axis=-2)
-    return R
+    return R @ flip_matrix()
 
 
 def best_of_k(losses, correct, k, trials, rng):
@@ -98,12 +85,10 @@ def run(loss_name, loss_fn, target, camera, truth, model, rng):
 
     losses, finals = [], []
     for R0 in starts:
-        rot, tr, trace = register(model, camera, target, matrix_to_axis_angle(R0),
-                                  np.zeros(3), loss_fn, iterations=ITERATIONS,
-                                  lr_rot=0.08, lr_trans=0.02, centre=ORIGIN)
-        finals.append(axis_angle_to_matrix(
-            torch.as_tensor(rot.numpy(), dtype=torch.float64)).numpy())
-        losses.append(trace[-1])
+        R, loss = register_from(model, camera, target, R0, loss_fn, ITERATIONS,
+                                ACQUIRE_LR_ROT, ACQUIRE_LR_TRANS, centre=ORIGIN)
+        finals.append(R)
+        losses.append(loss)
     losses = np.array(losses)
 
     to_truth = np.array([geodesic(R, truth) for R in finals])

@@ -1,0 +1,15 @@
+# Is the acquired pose the target, or its 180 degree flip about the panel axis?
+#
+# One extra render. The photometric loss is evaluated at the pose held and at
+# its flip, and the lower one wins. This is only meaningful while the body
+# frame sun is near where the splat model was fitted: measured, the test reads
+# 3.84x at 0 degrees, 1.69x at 15, exactly 1.00x at 28, and inverts past 40,
+# where it would repair a correct pose into the flip. The service therefore
+# refuses rather than answering outside its window.
+float64 max_sun_angle_deg   # refuse above this; 15.0 is the working default
+---
+bool valid                  # false means the window was exceeded and nothing was decided
+bool repaired               # true means the acquired pose was the flip and has been corrected
+float64 ratio               # loss at the flipped pose over loss at the pose held
+float64 sun_angle_deg       # the body frame sun angle the verdict was taken at
+string reason

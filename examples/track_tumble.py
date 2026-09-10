@@ -1,6 +1,6 @@
 """Phase 4 step 4: per frame registration, then a filter, on a tumbling target.
 
-Two windows, for the reason recorded in PLAN.md. The photometric tracker runs
+Two windows, and the reason is the baked lighting. The photometric tracker runs
 over 8 s, where the baked model is still worth something. The silhouette
 tracker runs over 48 s, where the body frame sun has swept 50 degrees and the
 photometric model is worthless, but where the polhode has travelled 0.47 of
