@@ -307,7 +307,9 @@ Building that check found four defects, three of them in the code written to run
 
 ## Bugs found and fixed
 
-Six, and what they have in common is worth naming first. Every one was a silent substitution or an unstated convention that produced a plausible number rather than an error, and not one was found by reading code. Four were found by a second implementation or a second model disagreeing with the first.
+Nine, and what they have in common is worth naming first. Every one was a silent substitution or an unstated convention that produced a plausible number rather than an error, and not one was found by reading code. Most were found by a second implementation, a second model, or a guard that refused to run a test that could not fail.
+
+One pattern recurs often enough to be worth stating on its own: a call reports success for the call and not for the effect. That is the second entry below, and it covers four separate instances in one pose path.
 
 ### The forward kinematics was verified to 5.7e-08 and wrong
 
@@ -318,6 +320,38 @@ It was still wrong. That composition is correct only while every inertial frame 
 Five hundred configurations of a model that cannot express the failure is five hundred configurations of evidence for nothing. The fix is not a better composition, it is to stop depending on the question: joint origins now come from the URDF, which states them relative to the parent link frame and says nothing about inertial frames at all. The regression is a chain built specifically to have rotated inertial frames.
 
 Two more conventions had been pinned on exactly the same insufficient evidence and fell out with it. calculateJacobian's localPosition is in the link's inertial frame, so a centre of mass Jacobian needs R_inertial^T times getDynamicsInfo field 3, not field 3 itself. calculateMassMatrix writes the base twist in the base link's inertial axes, not merely about that point; rotating H_b and H_bm into those axes took the residual from 1.25 down to 5.6e-09. Both reduce to what phase 2 concluded when the rotation is the identity, which on that model it always was.
+
+### Four calls that reported success and did nothing
+
+All four in the same pose path, and the fourth is the one that makes the point.
+
+`set_pose` accepts a link name, returns true, and leaves the link exactly where it was, because only model level poses are settable. Every rigid body in the scene is therefore its own model rather than a link inside one.
+
+A single unknown name voids an entire `set_pose_vector` batch and the service still answers true. The scene node had built its driving list from PyBullet's links, which include `panda_link8`, a flange frame with no visual that the scene generator never emits. The whole scene froze while every call reported success. The generator now writes a manifest of the models it actually emitted, the node drives exactly those, and a startup check confirms each one exists in the running world.
+
+A world that declares its plugins explicitly replaces the simulator's defaults, and without the Physics system among them it accepts poses and never applies them. Declared static models are still not integrated, which is the point, but something in the physics update has to commit a user command for it to take effect.
+
+The fourth produced the identical symptom from a different cause: a misread flag, an update rate in Hz rather than a real time multiplier, which ran the world at a thousandth of real time so commands were queued and essentially never applied. That is why the return value is worth nothing either way. The symptom does not identify the cause, and the only reliable check is to read what the engine is actually doing, which is what the scene node's startup guard does against the topic carrying exactly the poses the physics engine is updating.
+
+### A camera that rendered black and said nothing
+
+`look_at` returned a singular rotation whenever the up vector lay along the line of sight, which it did: the client sat directly above the servicer and the up vector was also world +z. The cross product is zero, the rotation matrix is singular, every ray degenerates, and the render comes out uniformly black.
+
+That reads as an empty scene rather than a broken camera, which is why it cost a session. It also broke perception silently in a second way, because a black image has no gradient for a registration to follow. It refuses now, and both the refusal and a demonstration that a singular camera really does render an empty frame are in the suite.
+
+### A silhouette loss that was measuring brightness
+
+The silhouette loss thresholded the rendered image, which is radiance, so a face turned away from the light counted as empty space. The loss moved 1.03x under a two degree rotation and the round trip check refused to proceed, on the grounds that a perturbation the loss cannot see is not a test of recovery.
+
+The renderer now returns accumulated coverage, which is opacity rather than brightness. With that fixed the silhouette loss is the more sensitive of the two at small perturbations, 1.7e-02 against 5.8e-03 at two degrees.
+
+The same check surfaced a fault in its own diagnostic. It reported sensitivity as a ratio against a baseline that is exactly zero, because the observation is a render of the model being fitted, and printed 5.8e9 as though that were a measurement.
+
+### A rotation vector that was silently wrong at exactly 180 degrees
+
+`matrix_to_axis_angle` took the axis from the antisymmetric part of the rotation matrix and divided by `2 sin(angle)`. At exactly pi the matrix is symmetric, that part is zero, and the expression is 0/0: it returned the zero vector, which is the identity.
+
+The worst possible failure, because a 180 degree flip is precisely what this project's degeneracy results are about, and the bug made a flipped pose evaluate as the true one. What gave it away was a loss ratio of exactly 1.00x at the first frame, which is too clean to be a measurement.
 
 ### A declared inertia that is a placeholder, and a phantom kilogram
 
@@ -345,7 +379,7 @@ The autograd version was structurally immune: differentiating the real chain can
 
 ## Tests
 
-32 cases across four files, 30 fast and 2 marked slow, each named for the invariant it protects rather than the function it calls: `test_proximal_link_has_zero_columns_for_joints_that_do_not_move_it`, not `test_link_jacobian`. Most exist because of one of the bugs above, which is why this section follows that one. They pass against both models.
+62 cases across seven files, 60 fast and 2 marked slow, each named for the invariant it protects rather than the function it calls: `test_proximal_link_has_zero_columns_for_joints_that_do_not_move_it`, not `test_link_jacobian`. Most exist because of one of the bugs above, which is why this section follows that one. The whole fast suite runs in under ten seconds.
 
 A test that cannot fail for a reason you can state is not protecting anything, so each guard was checked by breaking the thing it guards and confirming the case named for it is the one that fails.
 
@@ -355,12 +389,24 @@ A test that cannot fail for a reason you can state is not protecting anything, s
 | ancestor masking removed from the geometric Jacobian | `test_proximal_link_has_zero_columns_for_joints_that_do_not_move_it` |
 | damping zeroing made a no op | `test_link_damping_must_be_zeroed_explicitly_not_left_to_the_default` |
 | base twist integrated in the world frame | `test_base_twist_integrates_in_the_body_frame_not_the_world_frame` |
-| base reference point moved off the base centre of mass | `test_base_inertia_and_coupling_match_free_base_mass_matrix` |
 | the base twist layout guard removed | `test_a_swapped_base_twist_layout_is_rejected_not_silently_used` |
+| the projection Jacobian's perspective terms dropped | `test_the_projection_jacobian_matches_a_central_difference` |
+| the covariance not rotated into the camera frame | `test_the_projected_covariance_is_the_exact_marginal_under_orthographic` |
+| the tiled cutoff diverging from the dense one | `test_the_tiled_rasteriser_is_the_dense_one_at_the_same_cutoff` |
+| the Physics system removed from the world | `test_the_world_declares_the_physics_system_it_needs_to_apply_poses` |
+| the look_at degeneracy guard removed | `test_look_at_refuses_a_view_direction_along_the_up_vector` |
+| a world regenerated without rebuilding | `test_the_installed_world_is_the_one_the_launch_file_will_load` |
+| the skew matrix transposed | `test_angular_momentum_is_conserved_in_the_world_frame` |
 
-Three cases exist to stop others going vacuous. One asserts that some link really is proximal, so the zero columns loop has something to iterate over. One asserts the wrong base reference points genuinely do disagree with PyBullet, so the agreement of the right one is evidence rather than a loose tolerance. And the rotated inertial frame regression asserts that PyBullet really did rotate the frames before testing anything, because a tensor it rejects as unphysical is silently zeroed, which would make that test pass against the very bug it exists to catch.
+Several cases exist only to stop others going vacuous, and those are the ones worth having. One asserts that some link really is proximal, so the zero columns loop has something to iterate over. One asserts that PyBullet really did rotate the inertial frames before anything is tested against them, because a tensor it rejects as unphysical is silently zeroed and the case would otherwise pass against the very bug it exists to catch. One asserts that a Gaussian fixture is anisotropic and rotated, since a spherical covariance is unchanged by any rotation and cannot express a rotation error at all. And one asserts that an occlusion stack is not already in depth order, because the first version of it was, which made removing the depth sort a literal no operation.
+
+Two of those checks changed a case rather than confirming it, and both are worth stating. A threshold of 0.05 on the depth sort mutation failed at 4.955e-02, and lowering it would have been tuning a number until the test passed; it is judged against a control instead, the same stack already sorted, where removing the sort must change nothing at all. And a case claiming to protect the tumble's re-orthonormalisation does not: removing that step was measured and changes almost nothing, 2.5e-15 over 30 s against 4.2e-14 over 150,000 steps unaided. It catches a corrupted projection rather than a missing one, and its docstring now says so instead of claiming more than it delivers.
+
+Writing the scene cases found a defect in the generated world itself. It was not well formed XML: the header comment contained a double hyphen, which XML forbids inside a comment. The simulator's own parser reports it valid and reads it happily; a strict parser refuses outright. Found by parsing the artifact rather than searching it.
 
 Tolerances are measured rather than chosen wherever something else sets the floor. The H_b comparison is judged against PyBullet's own eigensolve residual on the same tensors, not against a constant.
+
+What is deliberately not here is as much the point. Anything needing a live simulator and a running ROS graph is absent: whether the world integrates nothing, whether a pose command is applied rather than merely acknowledged, whether the executive refuses to act on an unverified belief. Those need the stack up, and a unit test that mocked it would be testing the mock. They are named future work as a separate integration tier rather than faked here. The scripts under `examples/` remain the report behind each result and are run when the thing they cover changes.
 
 ## Limitations
 
@@ -376,6 +422,16 @@ Stated rather than softened. Where a method loses is part of the result.
 
 **Zero initial momentum is assumed throughout.** A real target tumbles and a real servicer arrives with residual rates. Every result starts from rest.
 
+**The reconstruction has its lighting baked in.** The fitted Gaussians carry the shading they saw on approach, so a client turning under a fixed sun drifts away from the model: 1.95 dB lost at 5 degrees of body frame sun motion, 11.07 at 20, 18.02 at 45. Every photometric result lives inside a short window because of it, including the flip detector, which inverts past 40 degrees. A relightable model, carrying a normal and an albedo per Gaussian and shading at render time, is the named prerequisite for removing that limit rather than an enhancement.
+
+**Acquisition costs restarts and is not real time.** Twenty two percent per attempt, about eight restarts for 87 percent, at 120 iterations each on CPU. One tracking step is 3.48 s. Nothing here has been asked to run at frame rate or on flight hardware, and the mission runs the scene at a fraction of real time so that acquisition and its verification both fit inside the window where the flip test still works.
+
+**The client is one synthetic object under one hard light.** No clutter, no second body, no sensor noise, no motion blur. The camera poses entering the reconstruction are exact because our own renderer produced them, so nothing here measures what pose error from structure from motion would do to the fit. Running the tracker on the simulator's imagery rather than on ray traced imagery is a real test of how far the model generalises off its own renderer, and it has not been done.
+
+**The simulator renders and hosts topics; it computes no physics.** Every model in the scene is static and every pose is commanded from the verified dynamics. That is a deliberate choice rather than a shortcut, and it means nothing here validates a second solver's free floating behaviour.
+
+**Nothing that needs a running simulator is under test.** The suite covers what can be established from the files and the libraries. Whether a pose command is applied rather than acknowledged, whether the startup guards fire against a live server, whether the executive refuses an unverified belief: all of that is exercised by running the mission, not by the suite.
+
 **J_g is built, not yet planned with.** The generalized Jacobian and its gradients exist and are verified against every reference available. No planner consumes them yet.
 
 ## Requirements
@@ -383,6 +439,8 @@ Stated rather than softened. Where a method loses is part of the result.
 Python 3.10+ and a CPU. No GPU needed; there is no CUDA dependency anywhere, which is deliberate.
 
 The C++ port and the identified model additionally need ROS 2 Jazzy with MoveIt 2 and `moveit_resources_panda_description`, all from the public ROS 2 apt repository. Everything in Python runs without them by setting `FFM_MODEL=pybullet`.
+
+The scene and the mission executive need three more, all from the same repository: Gazebo Sim, `ros_gz` for the bridge, and BehaviorTree.CPP. Two Gazebo installations commonly coexist on one machine, a standalone one and the one ROS vendors, and which runs is decided by `GZ_CONFIG_PATH` rather than by `PATH`. Reordering `PATH` changes nothing, and neither does invoking the other binary by absolute path, because `gz` is a launcher that loads whatever the config path points at. The launch file sets that variable explicitly and logs the version it resolved.
 
 ## Setup
 
@@ -423,6 +481,27 @@ python examples/verify_cpp_dynamics.py         # the C++ port against the torch 
 python examples/render_nonholonomy_gif.py      # the animation at the top of this file
 ```
 
+The second half of the project, in the order the pieces depend on each other:
+
+```bash
+python examples/render_target_views.py         # the approach imagery, and the checks on it
+python examples/verify_splatting.py            # the forward pass against five references
+python examples/build_model.py                 # fit one model and keep it, about 8 minutes
+python examples/fit_target.py                  # the scaling curve, about 33 minutes
+python examples/verify_registration.py         # the round trip through the renderer
+python examples/measure_relighting_cost.py     # what baked lighting costs as the body turns
+python examples/render_tumble.py               # the tumbling sequences, short and long
+python examples/track_tumble.py                # tracking, and the filter's prediction curve
+python examples/acquisition.py                 # acquisition from global initialisation
+python examples/handover.py acquire            # photometric acquisition, then
+python examples/handover.py track              # silhouette hold from what it found
+python examples/handover.py detect             # where the flip test is valid, and where not
+python examples/generate_scene_sdf.py          # the Gazebo world, generated from src/target.py
+python examples/verify_scene_integration.py    # the scene against the verified base rotation
+```
+
+`build_model.py` has to run before anything that tracks, because it produces the fitted model the others read. `generate_scene_sdf.py --check` fails if the committed world, or the installed copy the launch file loads, is no longer what the sources produce.
+
 The trajectory validity checker and its demonstration are C++ and need the
 workspace built and sourced:
 
@@ -436,9 +515,46 @@ The arguments are the URDF, an SRDF declaring a floating virtual joint, the bus
 mass in kg, an OMPL seed, and how many plans to sample. Twenty is a reasonable
 sample; one is a single draw from a randomised planner.
 
+The scene and the mission need four processes. Each wants ROS 2 and the
+workspace sourced first:
+
+```bash
+gz sim -s -r ws/src/free_floating_manipulation/models/servicing_scene.sdf
+ros2 run free_floating_manipulation scene_publisher.py
+ros2 run free_floating_manipulation perception_node.py
+ros2 run free_floating_manipulation mission_audit.py
+```
+
+Then one mission, which takes a couple of minutes and spends almost all of it
+on the eight acquisition restarts:
+
+```bash
+ros2 run free_floating_manipulation mission_executive \
+  ws/build/panda_identified.urdf /path/to/panda.srdf 8 false 2300
+```
+
+The arguments are the URDF, the SRDF, the restart budget, whether to inject a
+flipped belief after verification, and the bus mass in kg. With `false` the
+tree reports SUCCESS and the audit reports MISSION CORRECT. With `true` the
+tree still reports SUCCESS, every node passes including the flip test, and the
+audit reports the mission about 180 degrees wrong. That pair is the point of
+having an audit at all.
+
+Run them one at a time and read the audit before starting the next, and
+restart `scene_publisher.py` between missions: the client tumbles, and after a
+completed mission it has turned too far for the flip test to be valid, so the
+second mission will abort with the sun outside the window. That abort is the
+check working, but it is not what you want to watch.
+
+`scene_publisher.py` takes a `time_scale` parameter. The default is what a
+mission needs; a much larger value is for looking at the scene, where the
+default tumble is a fraction of a degree per second of wall clock and reads as
+a still image. The node warns when the value it is given would make a mission
+abort.
+
 `FFM_MODEL` selects the model: `identified` is the default and is Franka's published parameters, `pybullet` is the Panda that ships with PyBullet and is what phases 1 and 2 were measured on. Every script and every test runs against both.
 
-Run the tests with `pytest`. The two parameter sweeps are marked `slow` and left out of the default run; `pytest -m slow` runs those and `pytest -m "slow or not slow"` runs everything.
+Run the tests with `pytest`, which takes about ten seconds. The two parameter sweeps are marked `slow` and left out of the default run; `pytest -m slow` runs those and `pytest -m "slow or not slow"` runs everything.
 
 ## Structure
 
