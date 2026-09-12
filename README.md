@@ -181,6 +181,66 @@ So this is a real hazard for a servicer of a few hundred kilograms and a margina
 
 One caveat on reproducibility. OMPL is not seedable through MoveIt's interface here: seeding `ompl::RNG` before the planner plugin loads and forcing a single planning attempt still returns 33, 16 and 22 waypoint paths for the same seed. The seed argument is kept and documented as insufficient rather than removed, and the distribution is reported rather than any single run, because reporting one run of a randomised planner would be selection.
 
+### Building a model of a target nobody has drawings of
+
+A servicer arrives with imagery. The reconstruction has to come from that, so the fit is reported as a curve of quality against compute rather than as a best result: what matters is not the number reached but what another doubling would have bought.
+
+![Held out PSNR against fitting budget, and the same curve per part of the satellite](docs/fit_scaling.png)
+
+Six independent fits, each with a schedule sized to its own budget, so every row is what that much compute actually buys rather than a checkpoint of a longer run under a schedule it never had.
+
+| budget | steps | object | whole frame | per doubling |
+| --- | --- | --- | --- | --- |
+| the visual hull alone | 0 | 15.68 dB | | |
+| 30 s | 433 | 22.36 dB | 27.86 dB | |
+| 60 s | 815 | 25.85 dB | 30.50 dB | +3.49 |
+| 120 s | 1533 | 28.32 dB | 32.49 dB | +2.47 |
+| 240 s | 2863 | 30.58 dB | 34.52 dB | +2.26 |
+| 480 s | 4926 | 33.88 dB | 37.99 dB | +3.30 |
+| 960 s | 10030 | 34.46 dB | 38.72 dB | +0.58 |
+
+The 960 s row exists because the first five did not turn over. A curve still linear in log time cannot say what a longer run would give, which is the only reason to draw one, so one sixteen minute run was spent settling it.
+
+Reading the last column needs the noise, and measuring it changed two conclusions. Four repeat draws at 240 s span 29.48 to 31.30 dB with a standard deviation of 0.75, so a difference between two budgets carries about 1.06 dB. That retires the apparent dip at +2.26 followed by +3.30, which is 1.04 dB and inside one standard deviation, and it downgrades the collapse to +0.58 from a plateau to a suggestion at about 2.6 standard deviations. Without the repeats the first would have looked like a real dip and the second like a real ceiling.
+
+Quality is reported over the object rather than the whole frame. The target covers 23.9 percent of the image and the rest is black, so the frame number flatters every row by about 5 dB and mostly measures how well black is reproduced.
+
+![Four held out views, truth above and the fitted model below](docs/fit_holdout.png)
+
+Per part scores are recorded and are confounded, which is worth saying rather than presenting them bare. The boom reaches 33.25 dB at 480 s, above the bus and the dish, and that is not evidence it was resolved better: it is small, dim and nearly uniform, which is easy in mean squared error. The slope carries the information. Over the last doubling the dish gains 0.70 dB and the boom 0.80 while the bus gains 1.06, and the dish ends lowest in absolute terms at 30.76 dB while flattening. The dish and the boom are the capacity limits, and the dish is arguably the worse of the two.
+
+### Tracking the target takes two losses, and each one's blind spot is the other's strength
+
+Photometric registration acquires from a cold start and cannot hold a long window. Silhouette registration holds indefinitely and cannot acquire at all. Neither alone is a tracker, and both failures have the same cause.
+
+The fitted model has the approach lighting baked into it. During the approach the sun was fixed in the world and the camera orbited, so in the target's body frame the light never moved, which is the assumption splatting makes. A tumbling client inverts that: the sun stays fixed and the body turns under it, so in the body frame the light direction moves and the model cannot represent it.
+
+| body frame sun moved | object PSNR | lost | lit pixels changed |
+| --- | --- | --- | --- |
+| 0 deg | 33.72 dB | the fit's own quality | 0.0% |
+| 5 deg | 31.76 dB | 1.95 dB | 10.0% |
+| 10 deg | 28.42 dB | 5.30 dB | 19.3% |
+| 20 deg | 22.65 dB | 11.07 dB | 36.0% |
+| 45 deg | 15.70 dB | 18.02 dB | 70.9% |
+
+That is the whole story of the pairing. Baked lighting is what breaks the 180 degree pose degeneracy of this target, which is why photometric can acquire; and it is what decays as the body turns, which is why photometric cannot hold. Silhouette discards shading, so it is immune to the decay, and for exactly that reason it has nothing left to break the degeneracy with.
+
+So the phase runs two windows. Photometric over 8 s, where the model is still worth something, holds to a worst attitude error of 2.60 degrees and a final 1.34, with no frame past 20 degrees. Its degradation against the body frame sun angle is mild: the median error goes from 0.781 degrees over the first two degrees of sun motion to 1.336 over the last three. Silhouette over the full 48 s holds to a worst of 4.67 degrees and a final of 1.21, again with no frame past 20, while the sun sweeps 49.6 degrees.
+
+**A prediction curve that had to be thrown away.** A filter is graded on how far ahead it can predict, not on how well it tracks the current frame, because the mission quantity is where the grapple fixture will be on arrival. The first grading said that integrating Euler's equations beat assuming a constant body rate by +0.01 to +0.54 degrees at a sixteen second lead. Essentially nothing, and the tempting conclusion is that tri-axial dynamics do not matter over that horizon.
+
+They were not being measured. The body rate came from a two frame difference of attitude estimates carrying a degree or two of error over a half second step, giving a rate error of 0.973 deg/s against a true rate of 2.7. Nothing downstream of an estimate with that signal to noise can depend on the propagator, so the comparison was measuring the rate estimator and reporting it as a fact about rigid body physics.
+
+Smoothing the rate over sixteen frames brings its error to 0.584 deg/s and the picture inverts.
+
+| lead | hold still | constant rate | Euler's equations |
+| --- | --- | --- | --- |
+| 1.0 s | 4.47 deg | 2.30 deg | 2.30 deg |
+| 4.0 s | 12.24 deg | 2.81 deg | 2.66 deg |
+| 16.0 s | 43.67 deg | 9.36 deg | **6.62 deg** |
+
+The tri-axial coupling is worth 2.74 degrees at a sixteen second lead, 29 percent, and it is worth nothing at all until the rate estimate is clean enough to show it. The smoothing sweep is reported rather than the best row, because the answer depends on a choice and quoting only the second would hide that.
+
 ## Bugs found and fixed
 
 Six, and what they have in common is worth naming first. Every one was a silent substitution or an unstated convention that produced a plausible number rather than an error, and not one was found by reading code. Four were found by a second implementation or a second model disagreeing with the first.
