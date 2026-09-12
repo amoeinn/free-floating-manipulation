@@ -126,6 +126,11 @@ class ScenePublisher(RosNode):
     def __init__(self):
         super().__init__("servicing_scene")
         self.declare_parameter("gazebo", True)
+        # Simulated seconds per wall second. The default is what a mission
+        # needs; a much larger value is for looking at the scene, where the
+        # tumble at 0.02 is 0.054 deg per 2.5 s of wall clock and reads as a
+        # still image.
+        self.declare_parameter("time_scale", TIME_SCALE)
 
         import pybullet as p
         import pybullet_data
@@ -220,11 +225,20 @@ class ScenePublisher(RosNode):
             self.gz = self._connect_gazebo()
         # dt is simulated; the timer is wall. Ticking slower is what makes
         # simulated time pass slower, because nothing else here is driving it.
-        self.timer = self.create_timer(self.dt / TIME_SCALE, self.step)
+        scale = float(self.get_parameter("time_scale").value)
+        if scale <= 0:
+            raise SystemExit("time_scale must be positive")
+        self.timer = self.create_timer(self.dt / scale, self.step)
         self.get_logger().info(
-            f"time scale {TIME_SCALE}: {self.dt:.3f} s of simulation per "
-            f"{self.dt / TIME_SCALE:.2f} s of wall clock, so acquisition's "
-            f"106 s costs about {106 * TIME_SCALE * 2.7:.1f} deg of tumble")
+            f"time scale {scale}: {self.dt:.3f} s of simulation per "
+            f"{self.dt / scale:.2f} s of wall clock, so acquisition's "
+            f"106 s costs about {106 * scale * 2.7:.1f} deg of tumble")
+        if scale > 0.05:
+            self.get_logger().warn(
+                f"time_scale {scale} is for watching, not for flying. "
+                f"Acquisition would spend {106 * scale * 2.7:.0f} deg of tumble "
+                "and the flip test would correctly refuse to answer beyond its "
+                "15 deg window, so a mission will abort.")
 
     def _connect_gazebo(self):
         from gz.msgs10.boolean_pb2 import Boolean

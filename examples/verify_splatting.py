@@ -26,6 +26,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.gaussian_scenes import (anisotropic_rotated, axial_slab,
+                                 discrimination, flip_matrix, occlusion_stack,
+                                 random_quaternions)
 from src.raytrace import Camera, look_at
 from src.splatting import (Gaussians, TorchCamera, project, projection_jacobian,
                            quaternion_to_rotation, render)
@@ -35,31 +38,7 @@ DT = torch.float64
 torch.manual_seed(20260907)
 
 
-def random_quaternions(n, generator):
-    q = torch.randn(n, 4, dtype=DT, generator=generator)
-    return q / q.norm(dim=-1, keepdim=True)
-
-
-def make_gaussians(n, spread=0.5, scale_range=(0.02, 0.09), opacity=0.35,
-                   centre=(0.0, 0.0, 0.0), seed=0, anisotropy=3.0):
-    g = torch.Generator().manual_seed(seed)
-    means = torch.as_tensor(centre, dtype=DT) + spread * (
-        torch.rand(n, 3, dtype=DT, generator=g) - 0.5)
-    lo, hi = scale_range
-    base = lo + (hi - lo) * torch.rand(n, 1, dtype=DT, generator=g)
-    # Deliberately elongated: a ratio of `anisotropy` between the longest and
-    # shortest axis, so the covariance is nothing like a scaled identity.
-    ratios = torch.stack([torch.ones(n, dtype=DT),
-                          torch.full((n,), 1.0 / anisotropy, dtype=DT),
-                          torch.full((n,), 1.0 / (anisotropy ** 0.5), dtype=DT)], dim=1)
-    scales = base * ratios
-    return Gaussians(
-        means=means,
-        log_scales=torch.log(scales),
-        quats=random_quaternions(n, g),
-        logit_opacity=torch.full((n,), float(np.log(opacity / (1 - opacity))), dtype=DT),
-        colors=torch.rand(n, 3, dtype=DT, generator=g) * 0.8 + 0.2,
-    )
+make_gaussians = anisotropic_rotated
 
 
 def camera_at(distance, width=32, height=32, fov=35.0, offset=(0.0, 0.0),
@@ -75,13 +54,7 @@ def camera_at(distance, width=32, height=32, fov=35.0, offset=(0.0, 0.0),
 
 def guard_anisotropic_and_rotated(gaussians, camera, label):
     """The test set must be able to express the bugs the tests exist to catch."""
-    scales = gaussians.scales
-    ratio = (scales.max(dim=1).values / scales.min(dim=1).values).min().item()
-    R = camera.R.to(DT)
-    cov_cam = R @ gaussians.covariance() @ R.T
-    diag = torch.diagonal(cov_cam, dim1=-2, dim2=-1).abs().max(dim=1).values
-    off = (cov_cam - torch.diag_embed(torch.diagonal(cov_cam, dim1=-2, dim2=-1))).abs()
-    off_ratio = (off.amax(dim=(1, 2)) / diag).max().item()
+    ratio, off_ratio = discrimination(gaussians, camera)
     print(f"  guard [{label}]: worst axis ratio {ratio:.2f} (want > 1.5), "
           f"largest off diagonal {off_ratio:.3f} of the diagonal (want > 0.05)")
     if ratio < 1.5 or off_ratio < 0.05:
@@ -305,51 +278,6 @@ def layer_c_regimes():
     for label, resid, rel, isolates in rows:
         print(f"  {label:<44} {resid:11.3e} {rel:12.3e}  {isolates}")
     return rows
-
-
-def occlusion_stack(opacity=0.25, depths=(2.4, 3.0, 3.6), extent=0.05):
-    """Gaussians stacked along one line of sight, differently coloured.
-
-    Built explicitly, because the point is a case where depth order decides
-    the pixel colour. The camera sits on +x at 3 m, so varying world x walks
-    them along the view axis while they stay on top of each other in the
-    image. They are returned deliberately out of depth order: the first
-    version of this returned them already sorted, which made removing the
-    sort a no operation and the mutation undetectable by construction.
-    """
-    n = len(depths)
-    order = [2, 0, 1][:n]
-    means = torch.zeros(n, 3, dtype=DT)
-    means[:, 0] = 3.0 - torch.as_tensor([depths[i] for i in order], dtype=DT)
-    colors = torch.tensor([[1.0, 0.1, 0.1], [0.1, 1.0, 0.1], [0.1, 0.1, 1.0]],
-                          dtype=DT)[:n]
-    return Gaussians(
-        means=means,
-        log_scales=torch.log(torch.full((n, 3), extent, dtype=DT)
-                             * torch.tensor([1.0, 0.6, 1.6], dtype=DT)),
-        quats=random_quaternions(n, torch.Generator().manual_seed(77)),
-        logit_opacity=torch.full((n,), float(np.log(opacity / (1 - opacity))), dtype=DT),
-        colors=colors)
-
-
-def axial_slab(n=4, lateral=2.2, along=0.45, across=0.06, opacity=0.06):
-    """Gaussians elongated along the view axis, far off centre in the frame.
-
-    The perspective terms of the Jacobian, `-fx x / z^2`, couple extent along
-    the view axis into image displacement. They therefore carry no weight
-    unless a Gaussian is both long in depth and off axis, which is why the
-    earlier random test sets could not detect their removal.
-    """
-    g = torch.Generator().manual_seed(5)
-    means = torch.zeros(n, 3, dtype=DT)
-    means[:, 0] = torch.linspace(-0.4, 0.4, n, dtype=DT)
-    means[:, 1] = lateral + 0.15 * torch.linspace(-1, 1, n, dtype=DT)
-    quats = torch.zeros(n, 4, dtype=DT)
-    quats[:, 0] = 1.0                       # long axis stays on the view axis
-    scales = torch.tensor([[along, across, across]], dtype=DT).repeat(n, 1)
-    return Gaussians(means, torch.log(scales), quats,
-                     torch.full((n,), float(np.log(opacity / (1 - opacity))), dtype=DT),
-                     torch.rand(n, 3, dtype=DT, generator=g) * 0.8 + 0.2)
 
 
 def mutation_check():
