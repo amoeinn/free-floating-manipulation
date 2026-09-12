@@ -241,6 +241,70 @@ Smoothing the rate over sixteen frames brings its error to 0.584 deg/s and the p
 
 The tri-axial coupling is worth 2.74 degrees at a sixteen second lead, 29 percent, and it is worth nothing at all until the rate estimate is clean enough to show it. The smoothing sweep is reported rather than the best row, because the answer depends on a choice and quoting only the second would hide that.
 
+### Acquiring lock is where more search makes the answer worse
+
+Every tracking result above starts frame zero at the truth. That is not a detail: it means each of them assumes an acquisition step, and this is the test of whether one exists. Forty orientations drawn uniformly over SO(3), a median of 116 and 130 degrees from the truth, each optimised alone with no warm start.
+
+| | photometric | silhouette |
+| --- | --- | --- |
+| lands in the true basin | 9 of 40, 22% | 7 of 40, 18% |
+| lands on the 180 degree flip | 2 of 40, 5% | 8 of 40, 20% |
+| lands somewhere else | 29 of 40, 72% | 25 of 40, 62% |
+| runs scoring below the best correct run | 0 | 9 |
+
+Per attempt the two are close. Everything turns on that last row, which is whether the loss can rank the answer once a search has found it.
+
+| lowest final loss | photometric | silhouette |
+| --- | --- | --- |
+| best run in the true basin | 1.1858e-02 | 7.0305e-02 |
+| best run on the flip | 2.9932e-02 | 7.7208e-02 |
+| best run in some other basin | 1.5647e-02 | **6.8352e-02** |
+
+For the photometric loss the true basin holds the lowest value anywhere, so taking the minimum over restarts converges on the truth. For the silhouette loss the lowest value found anywhere sits in a wrong basin and beats the best correct run. **The global minimum of the silhouette loss is not the true pose**, and the consequence follows mechanically.
+
+| restarts | photometric | silhouette |
+| --- | --- | --- |
+| 1 | 22% | 18% |
+| 2 | 40% | 24% |
+| 4 | 64% | 22% |
+| 8 | 87% | 11% |
+| 16 | 98% | 2% |
+| 32 | 100% | 0% |
+
+That column is not a plotting error. Photometric acquisition costs about eight restarts for 87 percent and sixteen for 98, at 120 iterations each. Silhouette acquisition gets monotonically worse with more restarts, because every extra draw is another chance to find a wrong basin that scores better than the right one, and best of k converges on being reliably wrong. Compute spent on it is worse than wasted.
+
+It is the same ordering the flip rejection ratios predicted, 2 to 4x against 1.1 to 1.3x, carried to its conclusion: a loss that barely separates the truth from its alternatives cannot be minimised into the truth.
+
+One pool of forty draws per loss, so a 22 percent rate carries about 6.5 points of binomial sampling error, and the best of k curve is a bootstrap over that pool and inherits it.
+
+### The mission reports SUCCESS and the audit reports 180 degrees wrong
+
+Photometric acquisition handed over to silhouette hold is the composition the two losses imply, and it costs nothing measurable. Over the full 48 s window an acquired pose tracks to a worst of 4.65 degrees against 4.69 for a run started at the truth, identical at the median. An acquisition 10.26 degrees off is pulled back by the tracker itself and ends at the same 1.13 degrees.
+
+The failure mode is total. Handed a flipped pose, the tracker holds it for all 48 seconds at a median error of 175.91 degrees, as smoothly and as confidently as it holds the right one, and nothing in the track reports it.
+
+That leaves the handover as the only moment the error can be caught, and the check is one extra render: evaluate the photometric loss at the acquired pose and at its flip, and keep the lower. Run on deliberately flipped poses, because staying quiet on correct ones is not evidence, it has a hard limit.
+
+| body frame sun | at a correct pose | at a flipped pose |
+| --- | --- | --- |
+| 0 deg | 3.84x, keep | 0.26x, repair |
+| 15 deg | 1.69x, keep | 0.59x, repair |
+| 28 deg | 1.00x | 1.00x |
+| 40 deg | **0.64x, repair** | 1.55x, keep |
+
+Decisive where the model was fitted, ambiguous by 28 degrees, and inverted beyond it: past 40 degrees the test would repair a correct pose into the flip. It is a handover time check and must never run later, which is the same short window limit the photometric channel has everywhere else in this project, appearing here as a validity bound on a detector rather than as tracking error.
+
+A behavior tree sequences all of it, and a behavior tree returning SUCCESS is the same class of claim as a simulator service returning true. So a separate node compares ground truth against the pose the mission published, and is subscribed to nothing the tree says about itself. It is held to the failure this project documented: a flip injected after verification, where nothing downstream can catch it.
+
+| run | the tree said | the audit said | final attitude error |
+| --- | --- | --- | --- |
+| nominal | SUCCESS | MISSION CORRECT | 0.852 deg |
+| flip injected after verification | SUCCESS | **MISSION WRONG** | **179.557 deg** |
+
+The mutated mission acquired at a loss of 1.159e-02, passed the flip test at 1.93x with the sun 1.9 degrees off, planned 21 waypoints, cleared both the fixed base and free floating collision checks, executed and reported SUCCESS. Every node returned SUCCESS and the mission was 180 degrees wrong.
+
+Building that check found four defects, three of them in the code written to run it: the audit kept state across missions and graded the previous mission's belief, the report was published before the first tracking estimate existed, a read modify write race let a tracking step overwrite the injected flip with a pose derived from the pre-flip belief, and the audit graded missions that never executed. Each of those would have produced a clean pass on a broken mission.
+
 ## Bugs found and fixed
 
 Six, and what they have in common is worth naming first. Every one was a silent substitution or an unstated convention that produced a plausible number rather than an error, and not one was found by reading code. Four were found by a second implementation or a second model disagreeing with the first.
