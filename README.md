@@ -4,7 +4,7 @@ Manipulation planning for an arm on an uncontrolled free floating base, with on 
 
 ![A free-floating Panda walks a closed loop in joint space; the joints come back to their starting angles and the base ends 18.98 degrees rotated](docs/closed_loop.gif)
 
-Two joints trace a circle in joint space and come back to the angles they started at, to within 4.71e-04 rad. The base does not come back. The consequence is not a correction term: the map from configuration to end effector pose stops being a function of configuration at all, because two paths that start and end at the same seven joint angles put the gripper in two different places. Every fixed base planner assumes that map exists. This repository builds the objects that replace it, measures how large the effect is, and then builds the whole thing a second time in C++ to find out what the first version had got wrong.
+Two joints trace a circle in joint space and come back to the angles they started at, to within 4.71e-04 rad. The base does not come back. The consequence is not a correction term: the map from configuration to end effector pose stops being a function of configuration at all, because two paths that start and end at the same seven joint angles put the gripper in two different places. Every fixed base planner assumes that map exists. This repository builds the objects that replace it, measures how large the effect is, and builds the whole thing a second time in C++ to find out what the first version had got wrong. Then it goes one step further out, because a servicer does not have drawings of its client either: it reconstructs the target from approach imagery, tracks pose against the model it built, and runs the result as a mission that can tell you it succeeded while being a hundred and eighty degrees wrong.
 
 ## What is here
 
@@ -35,6 +35,30 @@ J_m is pure geometry: link lengths and joint axes. J_g contains H_b^-1 H_bm, so 
 **A second implementation, in C++.** The same objects again, in Eigen, reading the model through MoveIt's RobotModel rather than PyBullet. It exists to disagree with the first one, and it did.
 
 **The model is Franka's published identified parameters**, not the Panda URDF that ships with PyBullet, whose declared inertia is a placeholder. Total mass 17.5869 kg, of which the base link is 0.6298 kg.
+
+**A 3D Gaussian splatting implementation, written rather than imported.** A servicer arrives with imagery and no drawings, so the model of the client has to be built from what it can see. The forward pass is projection, depth sort and alpha compositing in torch, differentiable end to end. It is written because no usable implementation could be a dependency here: OpenSplat is AGPLv3 and its copyleft would reach this repository, the INRIA reference is CUDA only and licensed for research and non-commercial use, and gsplat's licence is fine but its ROCm path does not support this machine's card. Licensing is the first argument and not the strongest one. A dependency removes the part worth doing and leaves nothing to disagree with, which is how every real bug in this project was found.
+
+```
+A   the 2D covariance against the exact marginal, orthographic   0.000e+00
+B   the perspective Jacobian against central differences         2.503e-09 px/m
+C0  the closed form line integral against numerical              5.069e-12
+D   front to back compositing against an independent back to front  2.220e-16
+E   gradients against central differences, all five groups       6.688e-08
+```
+
+**A volume renderer built only to disagree with it.** Layer C above: the same Gaussians rendered by brute force ray marching through a genuine 3D density field, sharing no code and no derivation with the splatting path. It is read as a regime table rather than asserted, because a splatting forward pass is not an exact volume renderer and the table measures how far apart the two are and why.
+
+**A reconstruction of the client from approach imagery alone.** 6000 Gaussians placed on a visual hull carved from silhouettes and known camera poses, 11,839 voxels at 128 cubed. The fitting path never reads the target's definition; the only quantity from outside the images is a bounding box that follows from the approach range and the field of view.
+
+![Sixty views of the client satellite over the approach, single hard light, no fill](docs/approach_views.png)
+
+Sixty views closing from 9.0 to 4.2 m over a 150 degree sweep, with elevation rising and falling so the views are not coplanar. One hard directional light and no ambient, because that is what orbit provides and it is harder for it.
+
+**Pose tracking on two losses, because neither alone is a tracker.** Photometric registration acquires from a cold start and cannot hold a long window. Silhouette registration holds indefinitely and cannot acquire at all. Both failures trace to the same cause, and that is the most useful thing the second half of this project produced.
+
+**A Gazebo scene and a ROS 2 mission executive.** Gazebo renders and hosts the topics; it computes no physics, because the dynamics are already verified and handing them to a second solver would mean either trusting it unchecked or spending a phase revalidating numbers that are in hand. A BehaviorTree.CPP tree sequences acquisition, verification, planning, the free floating trajectory check and execution.
+
+**An auditor that does not believe the executive.** A separate node comparing ground truth against the pose the mission published, never subscribed to anything the tree says about itself. A behavior tree returning SUCCESS is the same class of claim as a simulator service returning true, and the audit exists because that claim turned out to be worth exactly as little.
 
 Everything is checked against exact references rather than against each other.
 
@@ -295,13 +319,25 @@ Run the tests with `pytest`. The two parameter sweeps are marked `slow` and left
 ## Structure
 
 ```
-src/kinematics.py   differentiable forward kinematics, joint origins read from the URDF
-src/dynamics.py     floating base mass matrix, coupling inertia, generalized Jacobian
-src/freeflight.py   model selection, the joint loop, the zero gravity run, momentum
-examples/           one script per result, each printing a per item table
-tests/              32 invariants, each case named for what it protects
-ws/                 the C++ port and the trajectory validity checker, a colcon package
-docs/               figures, all regenerable from the scripts above
+src/kinematics.py       differentiable forward kinematics, joint origins read from the URDF
+src/dynamics.py         floating base mass matrix, coupling inertia, generalized Jacobian
+src/freeflight.py       model selection, the joint loop, the zero gravity run, momentum
+
+src/raytrace.py         an exact ray tracer over analytic primitives, for ground truth
+src/target.py           the client satellite, defined once and never read by the fit
+src/splatting.py        the Gaussian splatting forward pass, dense and tiled
+src/volume_reference.py brute force volume ray marching, built to disagree with it
+src/fitting.py          the visual hull, the fit, and saving the model
+src/tracking.py         pose registration against a fitted model
+src/acquisition.py      acquisition, the flip test, and a tracking step
+src/tumble.py           a torque free tri-axial tumble from Euler's equations
+src/gaussian_scenes.py  Gaussian sets built so specific errors can show themselves
+
+examples/               one script per result, each printing a per item table
+tests/                  60 invariants, each case named for what it protects
+ws/                     the C++ dynamics, the validity checker, the Gazebo scene,
+                        the perception node, the mission executive and the audit
+docs/                   figures, all regenerable from the scripts above
 ```
 
 `src/dynamics.py`'s module docstring is the reference for the frame conventions the rest of the code depends on, and `CONTRIBUTING.md` collects them alongside the working rules.
