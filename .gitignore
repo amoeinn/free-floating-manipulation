@@ -21,3 +21,8 @@ data/**/*.npz
 
 data/*.pt
 data/*.npz
+
+# The fit_target sweep's results record. Its companion predictions file is
+# already covered by data/*.npz above, and the two are only useful as a pair,
+# so they are ignored together the way every other derived file under data/ is.
+data/fit_scaling.json
