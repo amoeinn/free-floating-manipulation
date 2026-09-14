@@ -2,10 +2,16 @@
 
 Reported as a scaling curve rather than a single best result. When a result
 depends on a compute budget, the number that matters is quality against time,
-because that is what says whether a longer run would have helped. Five
-independent fits, each with its own schedule sized to its own budget, so each
-row is what you would actually get with that much compute and not a checkpoint
-of a longer run under a schedule it never had.
+because that is what says whether a longer run would have helped. One
+independent fit per budget in BUDGETS, each with its own schedule sized to its
+own budget, so each row is what you would actually get with that much compute
+and not a checkpoint of a longer run under a schedule it never had.
+
+The sweep costs about 43 minutes and writes its rows to `data/fit_scaling.json`
+alongside the figures, so `--replot` redraws both figures from that file in
+seconds without refitting. Everything either figure needs comes from that
+record, which is also what keeps a figure's own labels from disagreeing with
+the points on it.
 
 The fit sees images and camera poses. It never imports `target.py`. The
 initialisation is a visual hull carved from the silhouettes, which is
@@ -18,6 +24,8 @@ PSNR mostly measures how well black is reproduced: it reads 26.6 dB at a point
 where the object itself is at 21.4 dB.
 """
 
+import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -31,11 +39,23 @@ from src.fitting import initialise, learning_rates, psnr
 from src.splatting import Gaussians, TorchCamera, render, render_tiled
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# The two figures are coupled through the last budget, and the coupling is not
+# obvious from either one. fit_holdout.png takes its title and its images from
+# the final row, so any run that extends BUDGETS also relabels the held out
+# views: adding the 960 s point moved that figure from a 480 s fit to a 960 s
+# fit without anything about the holdout code changing. The portfolio review
+# document quotes both labels and the PSNR that goes with each, so a run that
+# changes BUDGETS invalidates both of its figure captions and they have to be
+# updated in the same change. Regenerating one of these figures without the
+# other is not possible here, and is not meant to be.
 BUDGETS = (30, 60, 120, 240, 480, 960)
 REPEAT_BUDGET = 240
 REPEAT_SEEDS = (11, 12, 13)
 N_GAUSSIANS = 6000
 HOLDOUT_EVERY = 6
+RESULTS = ROOT / "data" / "fit_scaling.json"
+PREDICTIONS = ROOT / "data" / "fit_scaling_preds.npz"
 
 
 def load():
@@ -119,6 +139,126 @@ def evaluate(g, images, cams, views, mask, parts, names):
     return obj, full, per_part, preds
 
 
+def build_record(rows, base_obj, names, voxels, repeats, holdout):
+    """The whole of what both figures need, in one serialisable structure.
+
+    Both the sweep and `--replot` draw from this and from nothing else. A
+    figure label taken from a module constant can disagree with the points
+    actually plotted, which is how fit_scaling.png came to be titled "five
+    independent fits" while BUDGETS held six; a label taken from the record
+    cannot.
+    """
+    return {
+        "schema": 1,
+        "n_gaussians": N_GAUSSIANS,
+        "hull_voxels": int(voxels),
+        "holdout_every": HOLDOUT_EVERY,
+        "hull_object_psnr": float(base_obj),
+        "part_names": list(names),
+        "holdout_views": [int(k) for k in holdout],
+        "rows": [
+            {"budget_s": int(b), "steps": int(st), "object_psnr": float(o),
+             "frame_psnr": float(f),
+             "per_part": {n: float(pp[n]) for n in names}}
+            for b, st, o, f, pp, _ in rows
+        ],
+        "repeats": {
+            "budget_s": REPEAT_BUDGET,
+            "extra_seeds": list(REPEAT_SEEDS),
+            # The first draw is the sweep's own row at this budget, so the
+            # list is one longer than extra_seeds.
+            "object_psnr": [float(x) for x in repeats],
+        },
+        "predictions_file": PREDICTIONS.name,
+    }
+
+
+def save_record(record, preds, picks):
+    """Rows to JSON, predicted pixels to a companion npz.
+
+    The images do not belong in the JSON, which exists to be read: four held
+    out predictions are three quarters of a megabyte of float32 and would bury
+    the rows they sit next to. The record names the companion file so the
+    replot path is driven by the JSON alone.
+    """
+    RESULTS.parent.mkdir(parents=True, exist_ok=True)
+    RESULTS.write_text(json.dumps(record, indent=2) + "\n")
+    np.savez_compressed(PREDICTIONS, views=np.asarray(picks, dtype=np.int64),
+                        images=np.stack([preds[k].clamp(0, 1).numpy() for k in picks]))
+    print(f"  wrote {RESULTS.relative_to(ROOT)} and {PREDICTIONS.relative_to(ROOT)}")
+
+
+def load_record():
+    if not RESULTS.exists():
+        raise SystemExit(f"no {RESULTS.relative_to(ROOT)}: run the sweep once to "
+                         f"produce it, which takes about 43 minutes")
+    record = json.loads(RESULTS.read_text())
+    companion = RESULTS.parent / record["predictions_file"]
+    if not companion.exists():
+        raise SystemExit(f"{RESULTS.relative_to(ROOT)} names {record['predictions_file']}, "
+                         f"which is missing; the held out figure cannot be drawn without it")
+    d = np.load(companion)
+    picks = [int(k) for k in d["views"]]
+    return record, picks, {k: d["images"][i] for i, k in enumerate(picks)}
+
+
+def plot(record, picks, preds, truth):
+    """Both figures, from the record and nothing else."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    rows, names = record["rows"], record["part_names"]
+    budgets = [r["budget_s"] for r in rows]
+    n = len(rows)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    axes[0].plot(budgets, [r["object_psnr"] for r in rows], "o-", label="object")
+    axes[0].plot(budgets, [r["frame_psnr"] for r in rows], "s--", label="whole frame")
+    axes[0].axhline(record["hull_object_psnr"], color="grey", ls=":",
+                    label="visual hull alone")
+    axes[0].set_xscale("log"); axes[0].set_xlabel("fitting budget (s, log scale)")
+    axes[0].set_ylabel("held out PSNR (dB)")
+    axes[0].set_title(f"Quality against compute, {n} independent "
+                      f"{'fit' if n == 1 else 'fits'}")
+    axes[0].legend(fontsize=8); axes[0].grid(alpha=0.3)
+    for name in names:
+        axes[1].plot(budgets, [r["per_part"][name] for r in rows], "o-", label=name)
+    axes[1].set_xscale("log"); axes[1].set_xlabel("fitting budget (s, log scale)")
+    axes[1].set_ylabel("held out PSNR (dB)")
+    axes[1].set_title("Per part: where the fit succeeds and where it does not")
+    axes[1].legend(fontsize=8); axes[1].grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(ROOT / "docs" / "fit_scaling.png", dpi=130)
+    plt.close(fig)
+    print(f"  wrote docs/fit_scaling.png")
+
+    # Title and images both come from the final row, which is the coupling
+    # described at the top of this file.
+    fig, axes = plt.subplots(2, len(picks), figsize=(2.4 * len(picks), 5))
+    for j, k in enumerate(picks):
+        axes[0, j].imshow(truth[k]); axes[0, j].set_title(f"view {k}", fontsize=8)
+        axes[1, j].imshow(preds[k])
+        for ax in (axes[0, j], axes[1, j]):
+            ax.axis("off")
+    axes[0, 0].set_ylabel("truth"); axes[1, 0].set_ylabel("fit")
+    fig.suptitle(f"Held out views, {rows[-1]['budget_s']} s fit, "
+                 f"{record['n_gaussians']} Gaussians")
+    fig.tight_layout()
+    fig.savefig(ROOT / "docs" / "fit_holdout.png", dpi=130)
+    plt.close(fig)
+    print(f"  wrote docs/fit_holdout.png")
+
+
+def replot():
+    """Redraw both figures from the last sweep. Seconds, not 43 minutes."""
+    record, picks, preds = load_record()
+    truth = np.load(ROOT / "data" / "approach" / "views.npz")["images"]
+    print(f"  replotting {len(record['rows'])} budgets from "
+          f"{RESULTS.relative_to(ROOT)}, no fitting")
+    plot(record, picks, preds, {k: truth[k] for k in picks})
+
+
 def main():
     torch.manual_seed(4); np.random.seed(4)
     d, intr, cams = load()
@@ -188,44 +328,32 @@ def main():
           f"{max(BUDGETS)/60:.0f} min,\n  which is what the 30 minute working budget "
           f"governs")
 
+    # The record is written before anything is drawn, so a sweep that survives
+    # the fitting is never lost to a plotting failure. Forty three minutes is
+    # too expensive to spend twice on a matplotlib error.
+    picks = holdout[:4]
+    record = build_record(rows, base_obj, names, voxels, repeats, holdout)
+    save_record(record, rows[-1][5], picks)
     try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-        axes[0].plot([r[0] for r in rows], [r[2] for r in rows], "o-", label="object")
-        axes[0].plot([r[0] for r in rows], [r[3] for r in rows], "s--", label="whole frame")
-        axes[0].axhline(base_obj, color="grey", ls=":", label="visual hull alone")
-        axes[0].set_xscale("log"); axes[0].set_xlabel("fitting budget (s, log scale)")
-        axes[0].set_ylabel("held out PSNR (dB)")
-        axes[0].set_title("Quality against compute, five independent fits")
-        axes[0].legend(fontsize=8); axes[0].grid(alpha=0.3)
-        for name in names:
-            axes[1].plot(BUDGETS, [r[4][name] for r in rows], "o-", label=name)
-        axes[1].set_xscale("log"); axes[1].set_xlabel("fitting budget (s, log scale)")
-        axes[1].set_ylabel("held out PSNR (dB)")
-        axes[1].set_title("Per part: where the fit succeeds and where it does not")
-        axes[1].legend(fontsize=8); axes[1].grid(alpha=0.3)
-        fig.tight_layout()
-        fig.savefig(ROOT / "docs" / "fit_scaling.png", dpi=130)
-        print(f"  wrote docs/fit_scaling.png")
-
-        preds = rows[-1][5]
-        picks = holdout[:4]
-        fig, axes = plt.subplots(2, len(picks), figsize=(2.4 * len(picks), 5))
-        for j, k in enumerate(picks):
-            axes[0, j].imshow(images[k].numpy()); axes[0, j].set_title(f"view {k}", fontsize=8)
-            axes[1, j].imshow(preds[k].clamp(0, 1).numpy())
-            for ax in (axes[0, j], axes[1, j]):
-                ax.axis("off")
-        axes[0, 0].set_ylabel("truth"); axes[1, 0].set_ylabel("fit")
-        fig.suptitle(f"Held out views, {BUDGETS[-1]} s fit, {N_GAUSSIANS} Gaussians")
-        fig.tight_layout()
-        fig.savefig(ROOT / "docs" / "fit_holdout.png", dpi=130)
-        print(f"  wrote docs/fit_holdout.png")
+        plot(record, picks, {k: rows[-1][5][k].clamp(0, 1).numpy() for k in picks},
+             {k: images[k].numpy() for k in picks})
     except ImportError:
-        pass
+        print(f"  matplotlib is absent, so no figures were drawn; the rows are "
+              f"in {RESULTS.relative_to(ROOT)} and --replot will draw them")
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--replot", action="store_true",
+                    help="redraw both figures from data/fit_scaling.json without refitting")
+    ap.add_argument("--budgets", type=int, nargs="+", metavar="S",
+                    help="override BUDGETS, in seconds; for exercising the path, "
+                         "not for producing a result")
+    args = ap.parse_args()
+    if args.budgets:
+        BUDGETS = tuple(args.budgets)
+        REPEAT_BUDGET = BUDGETS[-1]
+    if args.replot:
+        replot()
+    else:
+        main()
